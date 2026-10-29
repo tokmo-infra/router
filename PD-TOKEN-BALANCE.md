@@ -14,6 +14,8 @@
 
 指标：vllm_router_pd_token_balance_selected_total、vllm_router_pd_assigned_requests、vllm_router_pd_assigned_kv_tokens_estimate、vllm_router_pd_live_kv_usage。
 
+`vllm_router_pd_estimation_seconds{phase=...}` 拆分分词槽等待（slot_wait）、阻塞线程池等待（blocking_wait）、分词及前缀估算（compute）和估算全程（total）。这些是 Router 墙钟耗时，不是 GPU 计算或首 token 延迟；不改变选路公式。
+
 ## P KV 压力试验
 
 在原 JSON 中加入 `"prefill_kv_guard": true` 即可启用；删除该项恢复原计算量选路。它调整选路优先级，不是硬性 KV 准入限流。

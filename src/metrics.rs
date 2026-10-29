@@ -194,6 +194,10 @@ pub fn init_metrics() {
     }
 
     // PD-specific metrics
+    describe_histogram!(
+        "vllm_router_pd_estimation_seconds",
+        "PD prompt-estimation wall time by phase: slot_wait, blocking_wait, compute, total"
+    );
     describe_counter!(
         "vllm_router_pd_requests_total",
         "Total PD requests by route"

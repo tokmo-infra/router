@@ -183,13 +183,7 @@ impl VllmPDRouter {
         request: &Value, text: Option<&str>, headers: Option<&RequestHeaders>,
     ) -> Result<(usize, usize, OwnedLoadReservation, Option<TokenReservation>), String> {
         if let Some(b) = &self.token_balancer {
-            let slot = b.tokenization_slots.clone().acquire_owned().await.map_err(|e|e.to_string())?;
-            let owner = b.clone(); let value = request.clone();
-            let estimate = tokio::task::spawn_blocking(move || {
-                let _slot = slot; // remains held if the HTTP future is cancelled
-                owner.estimate(&value)
-            })
-                .await.map_err(|e|e.to_string())??;
+            let estimate = b.estimate_async(request).await?;
             let (p,d,pr,dr) = b.select(ps,ds,estimate).ok_or("no available PD workers")?;
             let mut reservation = OwnedLoadReservation::new(ds[d].clone());
             reservation.1 = Some(dr);
