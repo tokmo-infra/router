@@ -7235,7 +7235,6 @@ dependencies = [
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7273,7 +7272,6 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -7307,7 +7305,6 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -7327,7 +7324,6 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
@@ -7336,7 +7332,6 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "easy-ext",
  "serde",
@@ -7365,7 +7360,6 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7390,7 +7384,6 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm?tag=v0.29.0#98dff2a81d747d1dba01a47f939f48c3526d4206"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -7426,6 +7419,7 @@ dependencies = [
  "futures-util",
  "hf-hub 0.4.3",
  "http",
+ "http-body",
  "http-body-util",
  "k8s-openapi",
  "kube",
