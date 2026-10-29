@@ -49,6 +49,17 @@ pub(super) struct Estimate {
     output: usize,
     pages: Vec<[u8; 32]>,
 }
+// Fixed phase labels only; dropping also observes cancelled/error paths.
+struct EstimationTimer { phase: &'static str, start: Instant }
+impl EstimationTimer {
+    fn start(phase: &'static str) -> Self { Self { phase, start: Instant::now() } }
+}
+impl Drop for EstimationTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("vllm_router_pd_estimation_seconds", "phase" => self.phase)
+            .record(self.start.elapsed().as_secs_f64());
+    }
+}
 #[derive(Debug)]
 pub(super) struct Reservation {
     owner: Arc<TokenBalancer>,
@@ -169,6 +180,22 @@ impl TokenBalancer {
             }
         });
     }
+    pub(super) async fn estimate_async(self: &Arc<Self>, request: &Value) -> Result<Estimate, String> {
+        let _total = EstimationTimer::start("total");
+        let wait = EstimationTimer::start("slot_wait");
+        let slot = self.tokenization_slots.clone().acquire_owned().await.map_err(|e|e.to_string())?;
+        drop(wait);
+        let owner = self.clone();
+        let value = request.clone();
+        let blocking_wait = EstimationTimer::start("blocking_wait");
+        tokio::task::spawn_blocking(move || {
+            drop(blocking_wait);
+            // A cancelled HTTP future must not release a still-running tokenizer's slot.
+            let _slot = slot;
+            let _compute = EstimationTimer::start("compute");
+            owner.estimate(&value)
+        }).await.map_err(|e|e.to_string())?
+    }
     pub(super) fn estimate(&self, request: &Value) -> Result<Estimate, String> {
         // Keep tools ahead of messages, independent of temperature/stream/max_tokens.
         // No inference is sent, and no benchmark reference token counts are consumed.
@@ -257,6 +284,28 @@ mod tests {
         drop(d);
         assert_eq!(b.state.lock().demand["http://d:1"].kv,0.0);
         assert_eq!(b.state.lock().demand["http://d:1"].requests,0);
+    }
+    #[tokio::test] async fn async_estimation_preserves_tokens_and_releases_slot() {
+        let (b,_,_) = fixture();
+        let request = serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":12});
+        let expected = b.estimate(&request).unwrap();
+        let actual = b.estimate_async(&request).await.unwrap();
+        assert_eq!(actual.tokens, expected.tokens);
+        assert_eq!(actual.output, expected.output);
+        assert_eq!(actual.pages, expected.pages);
+        assert_eq!(b.tokenization_slots.available_permits(), 4);
+    }
+    #[tokio::test] async fn cancelled_slot_wait_does_not_consume_a_permit() {
+        let (b,_,_) = fixture();
+        let all = b.tokenization_slots.clone().acquire_many_owned(4).await.unwrap();
+        let owner = b.clone();
+        let task = tokio::spawn(async move { owner.estimate_async(&serde_json::json!({})).await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(all);
+        assert_eq!(b.tokenization_slots.available_permits(), 4);
     }
     #[test] fn cancellation_does_not_publish_cache_and_releases_all_demand() {
         let (b,ps,ds)=fixture();
