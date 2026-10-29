@@ -9,7 +9,7 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, RequestHeaders};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -19,6 +19,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
+use bytes::Bytes;
+use axum::body::HttpBody;
+use http_body::{Frame, SizeHint};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -39,6 +44,8 @@ struct MooncakePrefillInfo {
 pub struct VllmPDRouter {
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    // Shared by all direct routes; never held across an await.
+    decode_admission: parking_lot::Mutex<()>,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -63,6 +70,84 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+}
+
+// One owner, one release, including cancellation and body drop. This is local
+// assigned demand, not a backend queue or a KV occupancy measurement.
+struct OwnedLoadReservation(Arc<dyn Worker>);
+impl OwnedLoadReservation {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self(worker)
+    }
+}
+impl Drop for OwnedLoadReservation {
+    fn drop(&mut self) { self.0.decrement_load(); }
+}
+
+fn select_and_reserve_decode(
+    admission: &parking_lot::Mutex<()>,
+    policy: &dyn LoadBalancingPolicy,
+    workers: &[Arc<dyn Worker>],
+    text: Option<&str>,
+    headers: Option<&RequestHeaders>,
+) -> Option<(usize, OwnedLoadReservation)> {
+    let _lock = admission.lock();
+    // First attempt keeps the original policy input and cache/load math. If a
+    // selected worker becomes unavailable, remove it and retry remaining peers.
+    let mut candidates: Vec<(usize, Arc<dyn Worker>)> = workers.iter().cloned().enumerate().collect();
+    while !candidates.is_empty() {
+        let pool: Vec<Arc<dyn Worker>> = candidates.iter().map(|(_, w)| w.clone()).collect();
+        let selected = policy.select_worker_with_headers(&pool, text, headers)?;
+        let (original_idx, worker) = &candidates[selected];
+        if worker.is_available() {
+            return Some((*original_idx, OwnedLoadReservation::new(worker.clone())));
+        }
+        candidates.remove(selected);
+    }
+    None
+}
+
+// Inspired by #176; owns the same reservation created at admission (#373).
+// Wrap Body frames rather than data_stream so this layer preserves trailers.
+struct ReservedBody {
+    inner: Body,
+    reservation: Option<OwnedLoadReservation>,
+}
+impl HttpBody for ReservedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.reservation.take();
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool { self.inner.is_end_stream() }
+    fn size_hint(&self) -> SizeHint { self.inner.size_hint() }
+}
+// This mirrors the two-stage implementation's buffered merge branch exactly.
+fn is_buffered_logprobs_response(request: &Value) -> bool {
+    let needs_logprobs = request.get("logprobs").is_some()
+        || request.get("echo").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_streaming = request.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    needs_logprobs && !is_streaming
+}
+fn finish_reserved_response(response: Response, reservation: OwnedLoadReservation, buffered: bool) -> Response {
+    if buffered {
+        // The inner function has read and merged the full body before returning.
+        drop(reservation);
+        response
+    } else {
+        reserve_response_body(response, reservation)
+    }
+}
+
+fn reserve_response_body(response: Response, reservation: OwnedLoadReservation) -> Response {
+    let (parts, body) = response.into_parts();
+    let body = ReservedBody { inner: body, reservation: Some(reservation) };
+    Response::from_parts(parts, Body::new(body))
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -281,11 +366,20 @@ impl VllmPDRouter {
                     );
                     return None;
                 };
-                Some(self.build_mooncake_decode_kv_transfer_params(
+                let mut params = self.build_mooncake_decode_kv_transfer_params(
                     transfer_id.unwrap_or(""),
                     &bootstrap_addr,
                     &engine_id,
-                ))
+                );
+                let Some(prefill) = prefill_response_json else {
+                    warn!("Mooncake PD requires measured P-side cache usage");
+                    return None;
+                };
+                if let Err(error) = super::pd_usage::attach_mooncake_prefill_usage(prefill, &mut params) {
+                    warn!("Refusing unverified Mooncake PD billing usage: {}", error);
+                    return None;
+                }
+                Some(params)
             }
             KvConnector::MoriIO => {
                 if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
@@ -1055,6 +1149,10 @@ impl VllmPDRouter {
             );
         }
 
+        if matches!(self.kv_connector, KvConnector::Mooncake)
+            && decode_request.pointer("/kv_transfer_params/remote_prefill_cached_tokens").is_none() {
+            return Err("Mooncake PD missing verified P cache usage or bootstrap metadata".into());
+        }
         let decode_request_str = serde_json::to_string(&decode_request)
             .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
 
@@ -1273,9 +1371,8 @@ impl VllmPDRouter {
 
     /// Two-stage request processing for vLLM disaggregated mode
     ///
-    /// This function handles fine-grained load tracking: the prefill worker's load is only
-    /// incremented during the prefill phase, and the decode worker's load is only incremented
-    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    /// The direct route owns decode admission through response-body completion.
+    /// Prefill uses an independent cancellation-safe reservation.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1313,7 +1410,7 @@ impl VllmPDRouter {
         );
 
         // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        let prefill_reservation = OwnedLoadReservation::new(prefill_worker.clone());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1408,7 +1505,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1430,7 +1526,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1460,7 +1555,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1474,9 +1568,8 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
-        prefill_worker.decrement_load();
-        decode_worker.increment_load();
+        // Prefill is complete; decode remains reserved by the direct route.
+        drop(prefill_reservation);
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1498,6 +1591,11 @@ impl VllmPDRouter {
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
             );
+            if matches!(self.kv_connector, KvConnector::Mooncake) {
+                return Err(PDRouterError::InvalidConfiguration {
+                    reason: "Mooncake PD missing verified P cache usage or bootstrap metadata".into(),
+                });
+            }
         }
 
         // Use endpoint_url() to get the base URL without @rank suffix,
@@ -1558,7 +1656,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1574,8 +1671,6 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -1744,8 +1839,7 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
-        decode_worker.increment_load();
+        let prefill_reservation = OwnedLoadReservation::new(prefill_worker.clone());
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -1772,7 +1866,7 @@ impl VllmPDRouter {
             ),
         );
 
-        prefill_worker.decrement_load();
+        drop(prefill_reservation);
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
@@ -1782,7 +1876,6 @@ impl VllmPDRouter {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
             Ok(resp) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1796,7 +1889,6 @@ impl VllmPDRouter {
                 });
             }
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1817,7 +1909,6 @@ impl VllmPDRouter {
         let decode_response = match decode_result {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1832,7 +1923,6 @@ impl VllmPDRouter {
                 });
             }
         };
-        decode_worker.decrement_load();
 
         let needs_logprobs = decode_request.get("logprobs").is_some()
             || decode_request
@@ -1916,6 +2006,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                decode_admission: parking_lot::Mutex::new(()),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2006,6 +2097,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                decode_admission: parking_lot::Mutex::new(()),
             })
         }
     }
@@ -2250,7 +2342,9 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
+                &self.decode_admission,
+                decode_policy.as_ref(),
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
@@ -2268,8 +2362,8 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
+            let buffered_response = is_buffered_logprobs_response(&request_json);
+            // Decode reservation covers selection, both stages, and the response body.
 
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2292,7 +2386,7 @@ impl RouterTrait for VllmPDRouter {
             {
                 Ok(response) => {
                     info!("Two-stage processing completed successfully");
-                    response
+                    finish_reserved_response(response, decode_reservation, buffered_response)
                 }
                 Err(e) => {
                     error!("Two-stage processing failed: {}", e);
@@ -2421,7 +2515,9 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
+                &self.decode_admission,
+                decode_policy.as_ref(),
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
@@ -2439,8 +2535,8 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            // Load tracking is handled inside process_vllm_two_stage_request for fine-grained
-            // tracking: prefill load only during prefill phase, decode load only during decode phase.
+            let buffered_response = is_buffered_logprobs_response(&request_json);
+            // Decode reservation covers selection, both stages, and the response body.
 
             info!(
                 "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
@@ -2463,7 +2559,7 @@ impl RouterTrait for VllmPDRouter {
             {
                 Ok(response) => {
                     info!("Two-stage processing completed successfully");
-                    response
+                    finish_reserved_response(response, decode_reservation, buffered_response)
                 }
                 Err(e) => {
                     error!("Two-stage processing failed: {}", e);
@@ -2643,7 +2739,9 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker_with_headers(
+            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
+                &self.decode_admission,
+                decode_policy.as_ref(),
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
@@ -2661,6 +2759,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            let buffered_response = is_buffered_logprobs_response(&request_json);
 
             debug!(
                 "Transparent proxy: prefill={}, decode={}",
@@ -2679,7 +2778,7 @@ impl RouterTrait for VllmPDRouter {
                 )
                 .await
             {
-                Ok(response) => response,
+                Ok(response) => finish_reserved_response(response, decode_reservation, buffered_response),
                 Err(e) => {
                     error!(
                         "Transparent proxy request failed: prefill={}, decode={}, error={}",
@@ -2719,6 +2818,171 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reserved_test_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode))
+    }
+
+    #[test]
+    fn test_reserved_admission_barrier_hot_cold_and_sentinel() {
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy};
+        use std::sync::Barrier;
+        for n in [16, 32] {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                cache_threshold: 0.3, balance_abs_threshold: 4,
+                balance_rel_threshold: 1.5, eviction_interval_secs: 0,
+                max_tree_size: 100000,
+            });
+            let workers: Vec<Arc<dyn Worker>> = (0..16).map(|i|
+                reserved_test_worker(&format!("http://decode{i}:8000"))).collect();
+            policy.init_workers(&workers);
+            let admission = parking_lot::Mutex::new(());
+            let sentinel = OwnedLoadReservation::new(workers[0].clone());
+            for hot in [false, true] {
+                let start = Barrier::new(n);
+                let done = Barrier::new(n);
+                let guards = std::thread::scope(|scope| {
+                    let mut tasks = Vec::new();
+                    for i in 0..n {
+                        let (policy, workers, admission, start, done) =
+                            (&policy, &workers, &admission, &start, &done);
+                        tasks.push(scope.spawn(move || {
+                            let text = if hot { "same prefix".to_string() }
+                                       else { format!("cold unique {i:04}") };
+                            start.wait();
+                            let (idx, guard) = select_and_reserve_decode(
+                                admission, policy, workers, Some(&text), None).unwrap();
+                            done.wait();
+                            (idx, guard)
+                        }));
+                    }
+                    tasks.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>()
+                });
+                assert!(guards.iter().any(|(idx, _)| *idx != guards[0].0));
+                assert_eq!(workers.iter().map(|w| w.load()).sum::<usize>(), n+1);
+                drop(guards);
+                assert_eq!(workers[0].load(), 1, "double decrement destroyed sentinel");
+                assert_eq!(workers.iter().map(|w| w.load()).sum::<usize>(), 1);
+            }
+            drop(sentinel);
+            assert_eq!(workers[0].load(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reserved_body_chunks_eof_error_drop_and_sentinel() {
+        use futures_util::StreamExt;
+        let worker = reserved_test_worker("http://decode:8000");
+        let sentinel = OwnedLoadReservation::new(worker.clone());
+        let chunks = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: first\n\n")),
+            Ok(Bytes::from_static(b"data: usage\n\n")),
+        ]);
+        let response = Response::builder().status(201).header("x-test", "unchanged")
+            .body(Body::from_stream(chunks)).unwrap();
+        let response = reserve_response_body(response, OwnedLoadReservation::new(worker.clone()));
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.headers()["x-test"], "unchanged");
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(worker.load(), 2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), Bytes::from_static(b"data: first\n\n"));
+        assert_eq!(worker.load(), 2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), Bytes::from_static(b"data: usage\n\n"));
+        assert_eq!(worker.load(), 2);
+        assert!(stream.next().await.is_none());
+        assert_eq!(worker.load(), 1);
+        drop(stream);
+        assert_eq!(worker.load(), 1);
+        let failed = futures_util::stream::iter(vec![Err::<Bytes, _>(std::io::Error::other("test"))]);
+        let response = reserve_response_body(Response::new(Body::from_stream(failed)),
+            OwnedLoadReservation::new(worker.clone()));
+        let mut stream = response.into_body().into_data_stream();
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(worker.load(), 1);
+        drop(stream);
+        assert_eq!(worker.load(), 1);
+        let pending = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let response = reserve_response_body(Response::new(Body::from_stream(pending)),
+            OwnedLoadReservation::new(worker.clone()));
+        assert_eq!(worker.load(), 2);
+        drop(response);
+        assert_eq!(worker.load(), 1);
+        drop(sentinel);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_reserved_unavailable_candidate_retry() {
+        #[derive(Debug)]
+        struct FirstPolicy;
+        impl LoadBalancingPolicy for FirstPolicy {
+            fn select_worker_with_headers(&self, workers: &[Arc<dyn Worker>], _: Option<&str>, _: Option<&RequestHeaders>) -> Option<usize> {
+                if workers.is_empty() { None } else { Some(0) }
+            }
+            fn name(&self) -> &'static str { "first_test" }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+        let first = reserved_test_worker("http://unavailable:8000");
+        let second = reserved_test_worker("http://available:8000");
+        first.set_healthy(false);
+        let workers = vec![first.clone(), second.clone()];
+        let lock = parking_lot::Mutex::new(());
+        let (idx, guard) = select_and_reserve_decode(&lock, &FirstPolicy, &workers, None, None).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(first.load(), 0);
+        assert_eq!(second.load(), 1);
+        drop(guard);
+        assert_eq!(second.load(), 0);
+        second.set_healthy(false);
+        assert!(select_and_reserve_decode(&lock, &FirstPolicy, &workers, None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reserved_body_preserves_trailers() {
+        use http_body_util::{BodyExt, StreamBody};
+        let worker = reserved_test_worker("http://decode:8000");
+        let sentinel = OwnedLoadReservation::new(worker.clone());
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-test-trailer", "preserved".parse().unwrap());
+        let frames = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(b"chunk"))),
+            Ok(Frame::trailers(trailers)),
+        ]);
+        let response = reserve_response_body(Response::new(Body::new(StreamBody::new(frames))),
+            OwnedLoadReservation::new(worker.clone()));
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"chunk"));
+        assert_eq!(worker.load(), 2);
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_trailers().unwrap()["x-test-trailer"], "preserved");
+        assert_eq!(worker.load(), 2);
+        assert!(body.frame().await.is_none());
+        assert_eq!(worker.load(), 1);
+        drop(body);
+        assert_eq!(worker.load(), 1);
+        drop(sentinel);
+    }
+
+    #[tokio::test]
+    async fn test_reserved_abort_and_replaced_worker_identity() {
+        let old = reserved_test_worker("http://decode:8000");
+        let new = reserved_test_worker("http://decode:8000");
+        let sentinel = OwnedLoadReservation::new(new.clone());
+        let old_guard = OwnedLoadReservation::new(old.clone());
+        let task = tokio::spawn(async move {
+            let _guard = old_guard;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(old.load(), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(old.load(), 0);
+        assert_eq!(new.load(), 1);
+        drop(sentinel);
+        assert_eq!(new.load(), 0);
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {

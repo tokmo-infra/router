@@ -551,6 +551,111 @@ pub struct ChatCompletionRequest {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+impl ChatCompletionRequest {
+    pub fn extract_full_history_routing_text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(tools) = &self.tools {
+            let mut tools = tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+            for tool in tools {
+                let parameters = serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "tool_schema:{}:{}:{}",
+                    tool.function.name.trim(),
+                    tool.function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        if let Some(functions) = &self.functions {
+            let mut functions = functions.iter().collect::<Vec<_>>();
+            functions.sort_by(|left, right| left.name.cmp(&right.name));
+            for function in functions {
+                let parameters = serde_json::to_string(&function.parameters)
+                    .unwrap_or_else(|_| "{}".to_string());
+                parts.push(format!(
+                    "function_schema:{}:{}:{}",
+                    function.name.trim(),
+                    function.description.as_deref().unwrap_or("").trim(),
+                    parameters
+                ));
+            }
+        }
+        for message in &self.messages {
+            match message {
+                ChatMessage::System { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("system:{}", text.trim()));
+                    }
+                }
+                ChatMessage::User { content, .. } => {
+                    for text in content.routing_texts() {
+                        parts.push(format!("user:{}", text.trim()));
+                    }
+                }
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    function_call,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        for text in content.routing_texts() {
+                            parts.push(format!("assistant:{}", text.trim()));
+                        }
+                    }
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            if let Some(arguments) = &call.function.arguments {
+                                if !arguments.trim().is_empty() {
+                                    parts.push(format!(
+                                        "assistant_tool_call:{}:{}",
+                                        call.function.name.trim(),
+                                        arguments.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(call) = function_call {
+                        if let Some(arguments) = &call.arguments {
+                            if !arguments.trim().is_empty() {
+                                parts.push(format!(
+                                    "assistant_function_call:{}:{}",
+                                    call.name.trim(),
+                                    arguments.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Tool { content, .. } => {
+                    if let Some(text) = content.as_str() {
+                        if !text.trim().is_empty() {
+                            parts.push(format!("tool:{}", text.trim()));
+                        }
+                    } else if let Some(items) = content.as_array() {
+                        for item in items {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                if !text.trim().is_empty() {
+                                    parts.push(format!("tool:{}", text.trim()));
+                                }
+                            }
+                        }
+                    }
+                }
+                ChatMessage::Function { content, name, .. } if !content.trim().is_empty() => {
+                    parts.push(format!("function:{}:{}", name.trim(), content.trim()));
+                }
+                _ => {}
+            }
+        }
+        parts.join("
+")
+    }
+}
+
 impl GenerationRequest for ChatCompletionRequest {
     fn is_stream(&self) -> bool {
         self.stream
@@ -566,8 +671,8 @@ impl GenerationRequest for ChatCompletionRequest {
             .and_then(|params| params.get("session_id"))
             .and_then(Value::as_str)
             .filter(|session_id| !session_id.trim().is_empty())
-            .unwrap_or_default()
-            .to_string()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.extract_full_history_routing_text())
     }
 
     fn extract_text_for_program_scheduling(&self) -> String {
