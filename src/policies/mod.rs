@@ -9,6 +9,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
+mod coupled_kv;
 mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
