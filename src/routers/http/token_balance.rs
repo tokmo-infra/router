@@ -20,12 +20,17 @@ struct Config {
     workers: HashMap<String, Capacity>,
     #[serde(default = "default_headroom")]
     kv_fraction: f64,
+    #[serde(default)]
+    prefill_kv_guard: bool,
 }
 fn default_headroom() -> f64 { 0.85 }
 #[derive(Debug, Default)]
 struct Demand { requests: usize, kv: f64, work: f64 }
+#[derive(Debug, Clone, Copy)]
+struct LiveKv { usage: f64, observed: Instant }
 #[derive(Debug)]
 struct State {
+    live_kv: HashMap<String, LiveKv>,
     demand: HashMap<String, Demand>,
     // Completed prefill page-prefix observations, with bounded memory and TTL.
     // Shared across P workers because their Mooncake Store is shared.
@@ -89,6 +94,24 @@ fn decode_score(d: &Demand, cap: &Capacity, tokens: f64, fraction: f64) -> f64 {
     let length_weight = (tokens / 131072.0).clamp(0.25, 3.0);
     requests + length_weight * kv + 100.0 * (kv - 1.0).max(0.0)
 }
+fn prefill_score(d: &Demand, cap: &Capacity, work: f64, kv: f64, fraction: f64, live: Option<f64>) -> f64 {
+    let assigned = (d.kv + kv) / (cap.kv_tokens * fraction);
+    let live_excess = live.map(|u| ((u - fraction) / (1.0 - fraction).max(0.01)).max(0.0)).unwrap_or(0.0);
+    let compute = (d.work + work) / cap.max_seqs;
+    compute * (1.0 + 2.0 * assigned.powi(2))
+        + 100_000.0 * (assigned - 1.0).max(0.0).powi(2)
+        + 100_000.0 * live_excess.powi(2)
+        + d.requests as f64 * 256.0
+}
+fn live_kv_rows(base: &str, body: &str, now: Instant) -> Vec<(String, LiveKv)> {
+    body.lines().filter(|l|l.starts_with("vllm:kv_cache_usage_perc{"))
+        .filter_map(|l| {
+            let rank = l.split("engine=\"").nth(1)?.split('"').next()?.parse::<usize>().ok()?;
+            let usage = l.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+            if !usage.is_finite() || !(0.0..=1.0).contains(&usage) { return None; }
+            Some((format!("{}@{}",base,rank),LiveKv{usage,observed:now}))
+        }).collect()
+}
 fn prefill_work(q: f64, c: f64) -> f64 {
     // Linear token work + attention q*(c+q/2), normalized to 128K.
     // Deliberately a heuristic, not an offline-fitted nanosecond cost model.
@@ -110,9 +133,41 @@ impl TokenBalancer {
             tokenizer.with_model(model);
         }
         tracing::info!(workers=config.workers.len(), kv_fraction=config.kv_fraction, "PD token balance enabled (heuristic cost; estimated token demand)");
-        Ok(Some(Arc::new(Self { config, tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(4)), state: Mutex::new(State {
-            demand: HashMap::new(), prefixes: LruCache::new(NonZeroUsize::new(262144).unwrap()),
-        }) })))
+        let enabled=config.prefill_kv_guard;
+        let result=Arc::new(Self { config, tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(4)), state: Mutex::new(State {
+            demand: HashMap::new(), live_kv:HashMap::new(), prefixes: LruCache::new(NonZeroUsize::new(262144).unwrap()),
+        }) });
+        if enabled { Self::start_kv_watch(&result); }
+        Ok(Some(result))
+    }
+    fn start_kv_watch(owner: &Arc<Self>) {
+        let weak=Arc::downgrade(owner);
+        tokio::spawn(async move {
+            let client=match reqwest::Client::builder().timeout(Duration::from_secs(2)).no_proxy().build() {
+                Ok(v)=>v,Err(e)=>{tracing::warn!(error=%e,"PD KV metric watcher unavailable");return;}
+            };
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(owner)=weak.upgrade() else {return};
+                let bases:Vec<_>=owner.config.workers.keys().cloned().collect();
+                let results=futures::future::join_all(bases.into_iter().map(|base| {
+                    let client=client.clone();
+                    async move {
+                        let response=client.get(format!("{}/metrics",base)).send().await.ok()?;
+                        if !response.status().is_success(){return None;}
+                        let body=response.text().await.ok()?;
+                        Some(live_kv_rows(&base,&body,Instant::now()))
+                    }
+                })).await;
+                let mut state=owner.state.lock();
+                for rows in results.into_iter().flatten() {
+                    for (url,row) in rows {
+                        metrics::gauge!("vllm_router_pd_live_kv_usage", "worker"=>url.clone()).set(row.usage);
+                        state.live_kv.insert(url,row);
+                    }
+                }
+            }
+        });
     }
     pub(super) fn estimate(&self, request: &Value) -> Result<Estimate, String> {
         // Keep tools ahead of messages, independent of temperature/stream/max_tokens.
@@ -146,8 +201,12 @@ impl TokenBalancer {
         let pi = ps.iter().enumerate().filter(|(_,w)|w.is_available())
             .filter_map(|(i,w)| {
                 let cap = self.config.workers.get(w.base_url())?;
+                let live=s.live_kv.get(w.url()).filter(|v|now.duration_since(v.observed)<Duration::from_secs(5)).map(|v|v.usage);
                 let d = s.demand.entry(w.url().into()).or_default();
-                Some((i, (d.work + work) / cap.max_seqs + d.requests as f64 * 256.0))
+                let score=if self.config.prefill_kv_guard {
+                    prefill_score(d,cap,work,kv,self.config.kv_fraction,live)
+                } else {(d.work + work) / cap.max_seqs + d.requests as f64 * 256.0};
+                Some((i,score))
             }).min_by(|a,b|a.1.total_cmp(&b.1))?.0;
         let di = ds.iter().enumerate().filter(|(_,w)|w.is_available())
             .filter_map(|(i,w)| {
@@ -163,7 +222,7 @@ impl TokenBalancer {
             metrics::gauge!("vllm_router_pd_assigned_kv_tokens_estimate", "worker" => w.url().to_string(), "stage" => stage).set(d.kv);
             Reservation { owner: self.clone(), url: w.url().into(), kv, work, pages, tokens:e.tokens, started:now, stage }
         };
-        let p = reserve(&ps[pi], "prefill", 0.0, work, e.pages);
+        let p = reserve(&ps[pi], "prefill", if self.config.prefill_kv_guard { kv } else { 0.0 }, work, e.pages);
         let d = reserve(&ds[di], "decode", kv, 0.0, Vec::new());
         Some((pi, di, p, d))
     }
@@ -181,10 +240,10 @@ mod tests {
         let ds:Vec<Arc<dyn Worker>>=vec![Arc::new(BasicWorker::new("http://d:1".into(),WorkerType::Regular))];
         let workers=HashMap::from([("http://p:1".into(),Capacity{kv_tokens:2e6,max_seqs:24.0}),
             ("http://d:1".into(),Capacity{kv_tokens:2e6,max_seqs:24.0})]);
-        let b=Arc::new(TokenBalancer{config:Config{tokenizer_path:String::new(),workers,kv_fraction:0.85},
+        let b=Arc::new(TokenBalancer{config:Config{tokenizer_path:String::new(),workers,kv_fraction:0.85,prefill_kv_guard:false},
             tokenizer:Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             tokenization_slots:Arc::new(tokio::sync::Semaphore::new(4)),
-            state:Mutex::new(State{demand:HashMap::new(),prefixes:LruCache::new(NonZeroUsize::new(20).unwrap())})});
+            state:Mutex::new(State{demand:HashMap::new(),live_kv:HashMap::new(),prefixes:LruCache::new(NonZeroUsize::new(20).unwrap())})});
         (b,ps,ds)
     }
     #[test] fn prefill_and_decode_have_independent_lifetimes() {
@@ -210,6 +269,20 @@ mod tests {
         let (b,ps,ds)=fixture(); ds[0].set_healthy(false);
         assert!(b.select(&ps,&ds,Estimate{tokens:1000,output:400,pages:vec![]}).is_none());
         assert_eq!(b.state.lock().demand["http://p:1"].requests,0);
+    }
+    #[test] fn prefill_kv_guard_avoids_pressure_with_equal_compute() {
+        let cap=Capacity{kv_tokens:2_000_000.0,max_seqs:24.0};
+        let d=Demand{requests:3,kv:400_000.0,work:4000.0};
+        assert!(prefill_score(&d,&cap,3000.0,130_000.0,0.85,Some(0.96))>
+                prefill_score(&d,&cap,3000.0,130_000.0,0.85,Some(0.40)));
+        let full=Demand{requests:3,kv:1_700_000.0,work:4000.0};
+        assert!(prefill_score(&full,&cap,3000.0,130_000.0,0.85,None)>
+                prefill_score(&d,&cap,3000.0,130_000.0,0.85,None));
+    }
+    #[test] fn live_kv_parser_keeps_ranks_and_rejects_invalid_data() {
+        let raw="vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"glm\"} 0.95\nvllm:kv_cache_usage_perc{engine=\"1\"} NaN\nvllm:kv_cache_usage_perc{engine=\"2\"} 1.9\n";
+        let rows=live_kv_rows("http://p:1",raw,Instant::now());
+        assert_eq!(rows.len(),1);assert_eq!(rows[0].0,"http://p:1@0");assert_eq!(rows[0].1.usage,0.95);
     }
     #[test] fn same_requests_long_kv_avoids_small_ep4() {
         let d=Demand{requests:8,kv:1_200_000.0,work:0.0};

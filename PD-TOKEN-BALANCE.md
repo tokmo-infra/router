@@ -8,6 +8,16 @@
 - D 在选路时预占，流式结束、取消或连接释放时归还；P 的计算需求在 P 阶段完成时归还。
 - 使用模型 tokenizer 对请求内容估算长度，额外计入输出预算和 10% 余量。估算用于选路，性能报告仍使用原生 usage。
 - 分词最多 4 路并行，关闭额外 BPE 缓存，不重复序列化大请求文本。
+- 可选 `prefill_kv_guard: true`：P 同时预占估算 KV，并参考每路真实 GPU KV 使用率；每秒刷新，超过 5 秒的观测不参与选路。默认关闭。
+- P 返回非成功 HTTP 状态时，保留上游错误原因，不再误报为缺少 usage。
 - 这是 Router 层启发式估算，不改变 vLLM 的 chunk 调度，不包含专家副本 EPLB 或离线拟合时间模型。
 
-指标：vllm_router_pd_token_balance_selected_total、vllm_router_pd_assigned_requests、vllm_router_pd_assigned_kv_tokens_estimate。
+指标：vllm_router_pd_token_balance_selected_total、vllm_router_pd_assigned_requests、vllm_router_pd_assigned_kv_tokens_estimate、vllm_router_pd_live_kv_usage。
+
+## P KV 压力试验
+
+在原 JSON 中加入 `"prefill_kv_guard": true` 即可启用；删除该项恢复原计算量选路。它调整选路优先级，不是硬性 KV 准入限流。
+
+- CPU 测试：717 项通过，另 12 项 WASM 示例测试未运行。
+- 模型仍用原 C230 镜像与 FP8/MTP3；不改 Mooncake 的读租约或缓存格式。
+- 基线终结后更换 Router、独立 DB 对照，记录 P/D 抢占、失败及 55% 后完整分钟性能。

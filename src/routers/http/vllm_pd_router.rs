@@ -1546,6 +1546,7 @@ impl VllmPDRouter {
             prefill_response.headers()
         );
 
+        let prefill_status = prefill_response.status();
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1575,6 +1576,15 @@ impl VllmPDRouter {
             );
         }
 
+        if !prefill_status.is_success() {
+            let error: Value=serde_json::from_slice(&prefill_bytes).unwrap_or(Value::Null);
+            let detail=error.pointer("/error/message").or_else(||error.get("message"))
+                .and_then(Value::as_str).unwrap_or("upstream error body unavailable");
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            return Err(PDRouterError::NetworkError { message:format!(
+                "Prefill HTTP {} from {}: {}",prefill_status,prefill_base_url,
+                detail.chars().take(1024).collect::<String>()) });
+        }
         // Parse prefill response to extract kv_transfer_params
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
