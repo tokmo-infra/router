@@ -1,6 +1,7 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
+use super::token_balance::{TokenBalancer, Reservation as TokenReservation};
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
@@ -46,6 +47,7 @@ pub struct VllmPDRouter {
     pd_router: PdRouterBase,
     // Shared by all direct routes; never held across an await.
     decode_admission: parking_lot::Mutex<()>,
+    token_balancer: Option<Arc<TokenBalancer>>,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -74,11 +76,11 @@ pub struct VllmPDRouter {
 
 // One owner, one release, including cancellation and body drop. This is local
 // assigned demand, not a backend queue or a KV occupancy measurement.
-struct OwnedLoadReservation(Arc<dyn Worker>);
+struct OwnedLoadReservation(Arc<dyn Worker>, Option<TokenReservation>);
 impl OwnedLoadReservation {
     fn new(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
-        Self(worker)
+        Self(worker, None)
     }
 }
 impl Drop for OwnedLoadReservation {
@@ -176,6 +178,27 @@ fn build_prefill_request_builder(
 }
 
 impl VllmPDRouter {
+    async fn select_direct_pair(
+        &self, ps: &[Arc<dyn Worker>], ds: &[Arc<dyn Worker>],
+        request: &Value, text: Option<&str>, headers: Option<&RequestHeaders>,
+    ) -> Result<(usize, usize, OwnedLoadReservation, Option<TokenReservation>), String> {
+        if let Some(b) = &self.token_balancer {
+            let slot = b.tokenization_slots.clone().acquire_owned().await.map_err(|e|e.to_string())?;
+            let owner = b.clone(); let value = request.clone();
+            let estimate = tokio::task::spawn_blocking(move || {
+                let _slot = slot; // remains held if the HTTP future is cancelled
+                owner.estimate(&value)
+            })
+                .await.map_err(|e|e.to_string())??;
+            let (p,d,pr,dr) = b.select(ps,ds,estimate).ok_or("no available PD workers")?;
+            let mut reservation = OwnedLoadReservation::new(ds[d].clone());
+            reservation.1 = Some(dr);
+            return Ok((p,d,reservation,Some(pr)));
+        }
+        let p = self.policy_registry.get_prefill_policy().select_worker_with_headers(ps,text,headers).ok_or("no prefill workers")?;
+        let (d,r) = select_and_reserve_decode(&self.decode_admission,self.policy_registry.get_decode_policy().as_ref(),ds,text,headers).ok_or("no decode workers")?;
+        Ok((p,d,r,None))
+    }
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
     async fn query_mooncake_bootstrap(
@@ -790,7 +813,7 @@ impl VllmPDRouter {
         }
 
         // Use policy-based load balancing to select prefill and decode workers
-        let request_text = serde_json::to_string(&request_json).ok();
+        let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
         let request_str = request_text.as_deref();
 
         let prefill_idx =
@@ -1380,6 +1403,7 @@ impl VllmPDRouter {
         decode_worker: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
+        prefill_token_reservation: Option<TokenReservation>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1568,7 +1592,8 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill is complete; decode remains reserved by the direct route.
+        // Prefill is complete; decode remains reserved through response EOF.
+        if let Some(r) = prefill_token_reservation { r.complete_prefill(&prefill_response_json); }
         drop(prefill_reservation);
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
@@ -2007,6 +2032,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 decode_admission: parking_lot::Mutex::new(()),
+                token_balancer: TokenBalancer::from_env()?,
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2038,6 +2064,11 @@ impl VllmPDRouter {
                 decode_policy.init_workers(&decode_workers);
             }
             info!("Initializing prefill and decode policies with workers.");
+
+            if let Some(b) = TokenBalancer::from_env()? {
+                b.validate_workers(&prefill_workers)?;
+                b.validate_workers(&decode_workers)?;
+            }
 
             // Query Mooncake bootstrap servers if kv_connector is mooncake
             let mooncake_prefill_info = Arc::new(Mutex::new(HashMap::new()));
@@ -2098,6 +2129,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 decode_admission: parking_lot::Mutex::new(()),
+                token_balancer: TokenBalancer::from_env()?,
             })
         }
     }
@@ -2310,7 +2342,7 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
+            let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
             let request_str = request_text.as_deref();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
@@ -2326,39 +2358,12 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
-                &self.decode_admission,
-                decode_policy.as_ref(),
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
+                match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
+                    request_str, request_headers.as_ref()).await {
+                    Ok(v) => v,
+                    Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+                };
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
@@ -2381,6 +2386,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/chat/completions",
                     headers,
+                    prefill_token_reservation,
                 )
                 .await
             {
@@ -2483,7 +2489,7 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
+            let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
             let request_str = request_text.as_deref();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
@@ -2499,39 +2505,12 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
-                &self.decode_admission,
-                decode_policy.as_ref(),
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
+                match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
+                    request_str, request_headers.as_ref()).await {
+                    Ok(v) => v,
+                    Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+                };
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
@@ -2554,6 +2533,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     "/v1/completions",
                     headers,
+                    prefill_token_reservation,
                 )
                 .await
             {
@@ -2707,7 +2687,7 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
+            let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
             let request_str = request_text.as_deref();
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
@@ -2723,39 +2703,12 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
-                &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
-                &self.decode_admission,
-                decode_policy.as_ref(),
-                &decode_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
+            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
+                match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
+                    request_str, request_headers.as_ref()).await {
+                    Ok(v) => v,
+                    Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+                };
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
@@ -2775,6 +2728,7 @@ impl RouterTrait for VllmPDRouter {
                     decode_worker.clone(),
                     path,
                     headers,
+                    prefill_token_reservation,
                 )
                 .await
             {
