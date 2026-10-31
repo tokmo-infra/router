@@ -5,8 +5,8 @@
 | 主机 | 角色 | TP / 全局DP / EP | 本地DP | API | seq/DP | batch/DP | util | CUDA Graph / 上限 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 32 | 2048 | 0.95 | NONE |
-| 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 2048 | 0.95 | 128 |
-| 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 2048 | 0.95 | 128 |
+| 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 1024 | 0.95 | 128 |
+| 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 1024 | 0.95 | 128 |
 
 | 项目 | 值 |
 | --- | --- |
@@ -19,6 +19,7 @@
 | MoE / FlashInfer autotune | 原生自动选择 / 原生自动调优 |
 | P all2all / D all2all | allgather_reducescatter / deepep_v2 |
 | D DeepEP补丁 | 镜像内置，AI_INFRA_DEEPEP_V2_NUM_SMS=32，不再额外挂载elastic.py |
+| Mooncake KV-load接收线程 | P=4，D=1 |
 | Tokenizer CPU预算 | P每GPU等效2GiB，每EP8组16GiB；D主节点85共享8GiB＋8个API各64MiB，共8.5GiB |
 | Tokenizer共享池 | P每API主机15.75GiB＋每API L1 64MiB；D主节点85共享8GiB＋每API L1 64MiB；headless不重复建池 |
 | L2 | 七台各750GiB，共5250GiB |
@@ -108,7 +109,7 @@ EXTRA_ENV=(); EXTRA_MOUNTS=(); API_ARGS=()
 case "$NODE" in
   81|83|84)
     ROLE=prefill; SUFFIX=prefill-$NODE-0; ENGINE="$PROJECT-$SUFFIX"
-    DP=8; SEQS=32; UTIL=0.95; ALL2ALL=allgather_reducescatter
+    DP=8; SEQS=32; BATCH_TOKENS=2048; RECV_THREADS=4; UTIL=0.95; ALL2ALL=allgather_reducescatter
     COMPILATION='{"cudagraph_mode":"NONE"}'
     PORT=31010; RPC=18360; BOOTSTRAP=27600; NET_IF=enp3s0f0np0; P2P=PXB
     KV_HCAS=mlx5_1,mlx5_3,mlx5_5,mlx5_7
@@ -119,7 +120,7 @@ case "$NODE" in
     ;;
   85|86|87|88)
     ROLE=decode; SUFFIX=decode-$NODE; ENGINE="$PROJECT-dmem095-$SUFFIX"
-    DP=32; SEQS=32; UTIL=0.95; ALL2ALL=deepep_v2
+    DP=32; SEQS=32; BATCH_TOKENS=1024; RECV_THREADS=1; UTIL=0.95; ALL2ALL=deepep_v2
     COMPILATION='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}'
     PORT=31011; RPC=28360; BOOTSTRAP=28600; NET_IF=ens50np0; P2P=PIX
     KV_HCAS=mlx5_2,mlx5_3,mlx5_4,mlx5_7
@@ -168,7 +169,7 @@ docker run -d --init --name "$PROJECT-$SUFFIX" --pull=never --network host \
   -e VLLM_HOST_IP="$IP" -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e VLLM_SSM_CONV_STATE_LAYOUT=DS -e VLLM_SERVER_DEV_MODE=1 -e VLLM_KV_CACHE_LAYOUT=BLHNC \
   -e MOONCAKE_CONFIG_PATH=/etc/vllm/mooncake.json -e VLLM_MOONCAKE_BOOTSTRAP_PORT="$BOOTSTRAP" \
-  -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_MOONCAKE_LOAD_RECV_THREADS=1 \
+  -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_MOONCAKE_LOAD_RECV_THREADS="$RECV_THREADS" \
   -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120 -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 \
   -e NCCL_SOCKET_IFNAME="$NET_IF" -e GLOO_SOCKET_IFNAME="$NET_IF" \
   -e NCCL_IB_DISABLE=0 -e NCCL_NET=IB -e NCCL_IB_HCA="$EP_HCAS" \
@@ -187,7 +188,7 @@ docker run -d --init --name "$PROJECT-$SUFFIX" --pull=never --network host \
   --data-parallel-address "$DP_IP" --data-parallel-rpc-port "$RPC" \
   --enable-expert-parallel --enable-ep-weight-filter --all2all-backend "$ALL2ALL" \
   --numa-bind --numa-bind-nodes 0 0 0 0 1 1 1 1 --max-model-len -1 \
-  --max-num-seqs "$SEQS" --max-num-batched-tokens 2048 --gpu-memory-utilization "$UTIL" \
+  --max-num-seqs "$SEQS" --max-num-batched-tokens "$BATCH_TOKENS" --gpu-memory-utilization "$UTIL" \
   --kv-cache-dtype fp8 --block-size 64 --attention-backend FLASHINFER_MLA_SPARSE_SM120 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --mamba-cache-mode align --mamba-ssm-cache-dtype float32 --no-disable-hybrid-kv-cache-manager \

@@ -13,13 +13,13 @@
 | P max-num-seqs | 24/DP | 32/DP |
 | D max-num-seqs | 16/DP | 32/DP |
 | P max-num-batched-tokens | 2048/DP | 2048/DP |
-| D max-num-batched-tokens | 1024/DP | 2048/DP |
+| D max-num-batched-tokens | 1024/DP | 1024/DP |
 | gpu-memory-utilization | P/D均0.95 | P/D均0.95 |
 | P compilation-config.cudagraph_mode | 未显式覆盖 | NONE |
 | D compilation-config | FULL_DECODE_ONLY，max_cudagraph_capture_size=64 | FULL_DECODE_ONLY，max_cudagraph_capture_size=128 |
 | P api-server-count | 每EP4实例4 | 每EP8实例4 |
 | D api-server-count | 每EP8实例1 | D85为8；86—88为0 |
-| VLLM_MOONCAKE_LOAD_RECV_THREADS | P=4，D原生默认 | P/D=1 |
+| VLLM_MOONCAKE_LOAD_RECV_THREADS | P=4，D原生默认 | P=4，D=1 |
 | scheduler-reserve-full-isl | true | false |
 | P all2all-backend | 未显式覆盖 | allgather_reducescatter |
 | D all2all-backend | 未显式覆盖 | deepep_v2 |
