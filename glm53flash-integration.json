@@ -36,7 +36,7 @@
   ],
   "vllm_repository": "https://github.com/tokmo-infra/vllm",
   "vllm_branch": "vllm-0.32.0-0.1.16-glm5.3-flash",
-  "C230_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT.md",
+  "C230_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT-C230.md",
   "validation": {
     "CPU_tests": "reuse original Linux test binary built from matching archived source",
     "reservation_cases": 5,
