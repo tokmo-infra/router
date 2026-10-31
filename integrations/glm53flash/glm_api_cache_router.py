@@ -22,6 +22,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 LOGGER = logging.getLogger(__name__)
+# The outer Rust router retires idle connections after 50s. Its pooled socket
+# must not outlive this server's idle timeout (Uvicorn's native default is 5s).
+HTTP_KEEP_ALIVE_SECONDS = 120
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -357,6 +360,7 @@ def main():
     parser.add_argument("--api-url", action="append")
     parser.add_argument("--api-socket", action="append")
     parser.add_argument("--shared-cache-path", default="")
+    parser.add_argument("--timeout-keep-alive", type=int, default=HTTP_KEEP_ALIVE_SECONDS)
     args = parser.parse_args()
     if bool(args.api_url) == bool(args.api_socket):
         parser.error("Choose either API TCP URLs or private Unix sockets")
@@ -369,7 +373,8 @@ def main():
         shared_cache_path=args.shared_cache_path,
         api_sockets=tuple(args.api_socket or []),
     )
-    uvicorn.run(create_app(config), host=args.host, port=args.port, access_log=False)
+    uvicorn.run(create_app(config), host=args.host, port=args.port, access_log=False,
+                timeout_keep_alive=args.timeout_keep_alive)
 
 
 if __name__ == "__main__":

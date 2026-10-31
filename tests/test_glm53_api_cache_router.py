@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from contextlib import contextmanager
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "integrations/glm53flash"))
-from glm_api_cache_router import ApiPool, RouterConfig, create_app, request_prefixes
+from glm_api_cache_router import ApiPool, RouterConfig, create_app, request_prefixes, HTTP_KEEP_ALIVE_SECONDS
 
 
 CONFIG = RouterConfig("http://control", ("http://api0", "http://api1"))
@@ -62,6 +62,50 @@ class ApiPoolTest(unittest.TestCase):
 
 
 class ForwardingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_real_gateway_keeps_outer_pooled_connection_past_native_five_seconds(self):
+        class Server(uvicorn.Server):
+            @contextmanager
+            def capture_signals(self):
+                yield
+
+        async def upstream(request):
+            return httpx.Response(200, stream=UpstreamBytes(b'data: [DONE]\n\n'),
+                                  headers={"content-type": "text/event-stream"})
+
+        app = create_app(CONFIG, httpx.MockTransport(upstream))
+        peers = []
+
+        @app.middleware("http")
+        async def record_peer(request, call_next):
+            peers.append(request.client.port)
+            return await call_next(request)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        server = Server(uvicorn.Config(app, log_level="critical",
+                        timeout_keep_alive=HTTP_KEEP_ALIVE_SECONDS))
+        task = asyncio.create_task(server.serve(sockets=[sock]))
+        try:
+            for _ in range(100):
+                if server.started:
+                    break
+                await asyncio.sleep(.01)
+            self.assertTrue(server.started)
+            self.assertGreater(HTTP_KEEP_ALIVE_SECONDS, 50)
+            async with httpx.AsyncClient(limits=httpx.Limits(keepalive_expiry=50),
+                    base_url=f"http://127.0.0.1:{port}", trust_env=False) as client:
+                self.assertEqual((await client.post("/v1/chat/completions", json=BODY)).status_code, 200)
+                await asyncio.sleep(5.2)
+                response = await client.post("/v1/chat/completions", json=BODY)
+                self.assertEqual(response.content, b'data: [DONE]\n\n')
+                self.assertEqual(peers[0], peers[1])
+                self.assertEqual(sum(app.state.pool.active), 0)
+        finally:
+            server.should_exit = True
+            await task
+            sock.close()
+
     async def test_real_unix_socket_preserves_body_rank_header_and_stream(self):
         class Server(uvicorn.Server):
             @contextmanager
