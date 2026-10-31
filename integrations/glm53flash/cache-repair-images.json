@@ -1,0 +1,12 @@
+{
+  "built_on": "p6kd-81",
+  "date": "2026-10-31",
+  "model_image": "sha256:011a4f3284855a4b91e85ec397dd89fdcc2839cb6c1501503706571d894aa2b3",
+  "router_image": "sha256:f1159b8dbe1756368601ca62e7cc520b6b1fa31efd7777e740b342978befdd6f",
+  "model_base": "540155b18ee7",
+  "router_base": "21c9cfa19e34",
+  "installed_image_cpu_tests": "31 passed",
+  "router_gateway_tests": "7 passed",
+  "gpu_inference_test": false,
+  "rust_router_sha256": "64361aa391fae97c996880c48726218fd96aad90e038db1470f4f5c90898b857"
+}

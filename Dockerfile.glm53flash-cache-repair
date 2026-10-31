@@ -1,0 +1,6 @@
+# Extend the supplied Router without rebuilding or replacing its Rust binary.
+FROM sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b
+COPY integrations/glm53flash/glm_api_cache_router.py /opt/glm-cache-repair/glm_api_cache_router.py
+COPY integrations/glm53flash/cache-repair-manifest.json /opt/glm53flash-router-cache-repair.json
+RUN python3 -m py_compile /opt/glm-cache-repair/glm_api_cache_router.py && python3 -c "import fastapi, httpx, uvicorn"
+LABEL glm.router.cache-repair="API-private-UDS; prefix-affinity; bounded-load" glm.router.base="21c9cfa19e34"

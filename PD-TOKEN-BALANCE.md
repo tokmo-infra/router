@@ -23,3 +23,14 @@
 - CPU 测试：717 项通过，另 12 项 WASM 示例测试未运行。
 - 模型仍用原 C230 镜像与 FP8/MTP3；不改 Mooncake 的读租约或缓存格式。
 - 基线终结后更换 Router、独立 DB 对照，记录 P/D 抢占、失败及 55% 后完整分钟性能。
+
+## API 分词缓存亲和代理
+
+外层仍负责GPU/DP选路；新增代理只选择同机API进程。共享分词池属于配套vLLM，代理不重新分词，也不注册额外GPU rank。
+
+~~~bash
+docker build -f Dockerfile.glm53flash-cache-repair -t local/glm53flash-router:0.1.16 .
+docker run --rm --network host --entrypoint python3 local/glm53flash-router:0.1.16 /opt/glm-cache-repair/glm_api_cache_router.py --help
+~~~
+
+P使用32110→31010，D主节点使用32111→31011；传入各API的--api-socket /run/glm-tokenizer/api-N.sock和--shared-cache-path /run/glm-tokenizer/segments.sqlite3。前缀阈值0.3、活跃请求差阈值8/比例1.5，前缀观察TTL1800秒。
