@@ -4,7 +4,7 @@
 
 | 主机 | 角色 | TP / 全局DP / EP | 本地DP | API | seq/DP | batch/DP | util | CUDA Graph / 上限 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 32 | 2048 | 0.95 | NONE |
+| 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 32 | 2048 | 0.95 | FULL_DECODE_ONLY / 256 |
 | 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 1024 | 0.95 | 128 |
 | 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 1024 | 0.95 | 128 |
 
@@ -22,22 +22,23 @@
 | Mooncake KV-load接收线程 | P=4，D=1 |
 | Tokenizer CPU预算 | P每GPU等效2GiB，每EP8组16GiB；D主节点85共享8GiB＋8个API各64MiB，共8.5GiB |
 | Tokenizer共享池 | P每API主机15.75GiB＋每API L1 64MiB；D主节点85共享8GiB＋每API L1 64MiB；headless不重复建池 |
+| Tokenizer共享载体 | 同机模型/API网关共享Docker tmpfs卷 |
 | L2 | 七台各750GiB，共5250GiB |
-| L3 | P每台1TiB，D每台3TiB，共15TiB |
+| L3 | 关闭；Master/Store enable_offload=false，无SSD目录挂载 |
 
 ## 公共变量
 
 ~~~bash
 export NODE=81  # 各机分别填写81、83、84、85、86、87、88
 export IP=11.5.0.$NODE
-export PROJECT=glm53flash-3p8-d32-l23-sharedcache-xinhao
-export WORK="${GLM_WORKDIR:-/data/bench/eng-xinhao/vllm-pd/glm53-flash/6000d-3p8-d32-l23-sharedcache-c718-a1024}"
+export PROJECT=glm53flash-3p4d-l2-20261031
+export WORK="${GLM_WORKDIR:-$HOME/yyf/glm53flash-3p4d-l2-20261031}"
 export MODEL_DIR="${GLM_MODEL_DIR:-/data/models/GLM-5.3-Flash-NVFP4}"
 export IMAGE=local/glm53flash-vllm:0.32.0
 export ROUTER_IMAGE=local/glm53flash-router:0.1.16
-export CACHE_PREFIX=glm53flash-mc-l23-sharedcache-c718-a1024-v1
+export CACHE_PREFIX=glm53flash-3p4d-l2-20261031-v1
 export ALL_HCAS=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-export TOKEN_DIR=/dev/shm/$PROJECT/tokenizer
+export TOKEN_VOLUME="$PROJECT-tokenizer"
 mkdir -p "$WORK/config"
 ~~~
 
@@ -52,21 +53,18 @@ docker run -d --init --name "$PROJECT-master-81" --pull=never --network host \
   --rpc_port=54395 --enable_http_metadata_server=true \
   --http_metadata_server_host=11.5.0.81 --http_metadata_server_port=54396 \
   --metrics_port=29495 --eviction_high_watermark_ratio=0.98 \
-  --enable_offload=true --offload_on_evict=true --offload_force_evict=false \
-  --promotion_on_hit=true --promotion_admission_threshold=2 \
-  --promotion_max_per_heartbeat=1 --allocation_strategy=local_first --logtostderr=true
+  --enable_offload=false --offload_on_evict=false --offload_force_evict=false \
+  --allocation_strategy=local_first --logtostderr=true
 ~~~
 
 ## Mooncake Store：七台各一个
 
 ~~~bash
 case "$NODE" in
-  81|83|84) L2=805306368000; L3=1099511627776; MEM=798g; CPUS=0-255 ;;
-  85|86|87|88) L2=805306368000; L3=3298534883328; MEM=798g; CPUS=0-127 ;;
+  81|83|84) L2=805306368000; MEM=798g; CPUS=0-255 ;;
+  85|86|87|88) L2=805306368000; MEM=798g; CPUS=0-127 ;;
 esac
-L3_PATH=/data/bench/eng-xinhao/mooncake-l3/glm53flash-3p8-d32-l23-sharedcache-c718-a1024-v1/node-$NODE
 TOPOLOGY="$WORK/config/mooncake-topology-store-$NODE.json"
-mkdir -p "$L3_PATH"
 cat > "$TOPOLOGY" <<'JSON'
 {"cpu:0":[["mlx5_0","mlx5_1","mlx5_2","mlx5_3"],["mlx5_4","mlx5_5","mlx5_6","mlx5_7"]],"cpu:1":[["mlx5_4","mlx5_5","mlx5_6","mlx5_7"],["mlx5_0","mlx5_1","mlx5_2","mlx5_3"]]}
 JSON
@@ -81,24 +79,13 @@ docker run -d --init --name "$PROJECT-store-$NODE" --pull=never --network host \
   -e MC_TE_FILTERS="$ALL_HCAS" -e MC_MS_AUTO_DISC=1 -e MC_MS_FILTERS="$ALL_HCAS" \
   -e MC_CUSTOM_TOPO_JSON=/etc/mooncake/topology.json \
   -e LD_LIBRARY_PATH=/opt/host-driver:/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib \
-  -e MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/var/lib/mooncake/l3 \
-  -e MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend \
-  -e MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE="$L3" \
-  -e MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES="$L3" \
-  -e MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES="$L3" \
-  -e MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru \
-  -e MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=4294967296 \
-  -e MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true \
-  -e MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO=0.90 \
-  -e MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO=0.80 \
-  -e MOONCAKE_OFFLOAD_USE_URING=false -e MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES=0 \
-  -v "$L3_PATH:/var/lib/mooncake/l3:rw" -v "$TOPOLOGY:/etc/mooncake/topology.json:ro" \
+  -v "$TOPOLOGY:/etc/mooncake/topology.json:ro" \
   -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/opt/host-driver/libcuda.so.1:ro \
   --entrypoint numactl "$IMAGE" --cpunodebind=0,1 --interleave=0,1 mooncake_client \
   --host="$IP:15495" --port=54495 --metadata_server=http://11.5.0.81:54396/metadata \
   --master_server_address=11.5.0.81:54395 --protocol=rdma --device_names="$ALL_HCAS" \
   --global_segment_size="$L2" --local_buffer_size=4294967296 \
-  --enable_offload=true --start_offload_rpc_server=true --enable_http_server=true \
+  --enable_offload=false --start_offload_rpc_server=false --enable_http_server=true \
   --http_port=29496 --logtostderr=true
 ~~~
 
@@ -109,8 +96,8 @@ EXTRA_ENV=(); EXTRA_MOUNTS=(); API_ARGS=()
 case "$NODE" in
   81|83|84)
     ROLE=prefill; SUFFIX=prefill-$NODE-0; ENGINE="$PROJECT-$SUFFIX"
-    DP=8; SEQS=32; BATCH_TOKENS=2048; RECV_THREADS=4; UTIL=0.95; ALL2ALL=allgather_reducescatter
-    COMPILATION='{"cudagraph_mode":"NONE"}'
+    DP=8; SEQS=32; BATCH_TOKENS=2048; RECV_THREADS=4; UTIL="${GLM_GPU_UTILIZATION:-0.95}"; ALL2ALL=allgather_reducescatter
+    COMPILATION='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":256}'
     PORT=31010; RPC=18360; BOOTSTRAP=27600; NET_IF=enp3s0f0np0; P2P=PXB
     KV_HCAS=mlx5_1,mlx5_3,mlx5_5,mlx5_7
     EP_HCAS='=mlx5_0:1,mlx5_2:1,mlx5_4:1,mlx5_6:1'
@@ -120,7 +107,7 @@ case "$NODE" in
     ;;
   85|86|87|88)
     ROLE=decode; SUFFIX=decode-$NODE; ENGINE="$PROJECT-dmem095-$SUFFIX"
-    DP=32; SEQS=32; BATCH_TOKENS=1024; RECV_THREADS=1; UTIL=0.95; ALL2ALL=deepep_v2
+    DP=32; SEQS=32; BATCH_TOKENS=1024; RECV_THREADS=1; UTIL="${GLM_GPU_UTILIZATION:-0.95}"; ALL2ALL=deepep_v2
     COMPILATION='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}'
     PORT=31011; RPC=28360; BOOTSTRAP=28600; NET_IF=ens50np0; P2P=PIX
     KV_HCAS=mlx5_2,mlx5_3,mlx5_4,mlx5_7
@@ -141,8 +128,8 @@ MC_CONFIG="$WORK/config/mooncake-$SUFFIX.json"
 mkdir -p "$CACHE"/{cuda,triton,tilelang,deep_ep}
 printf '%s\n' "$(date -u +%Y%m%dT%H%M%S)-$$" > "$CACHE/tokenizer-epoch"
 if [ "$APIS" -gt 0 ]; then
-  mkdir -p "$TOKEN_DIR"
-  EXTRA_MOUNTS+=(-v "$TOKEN_DIR:/run/glm-tokenizer:rw")
+  docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=34359738368,mode=0700 "$TOKEN_VOLUME" >/dev/null
+  EXTRA_MOUNTS+=(-v "$TOKEN_VOLUME:/run/glm-tokenizer:rw")
   EXTRA_ENV+=(-e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.sqlite3
     -e VLLM_GLM53_TOKENIZER_SHARED_GIB="$SHARED_GIB" -e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64
     -e VLLM_API_PRIVATE_SOCKET_DIR=/run/glm-tokenizer)
@@ -211,7 +198,7 @@ for ((i=0;i<APIS;i++)); do SOCKETS+=(--api-socket "/run/glm-tokenizer/api-$i.soc
 docker run -d --init --name "$PROJECT-api-router-$NODE" --pull=never --network host \
   --label ai-infra.project="$PROJECT" --memory 8g --cpus 4 --pids-limit 128 \
   -e NVIDIA_VISIBLE_DEVICES=void -e OMP_NUM_THREADS=1 \
-  -v "$TOKEN_DIR:/run/glm-tokenizer:rw" --entrypoint python3 "$ROUTER_IMAGE" \
+  -v "$TOKEN_VOLUME:/run/glm-tokenizer:rw" --entrypoint python3 "$ROUTER_IMAGE" \
   /opt/glm-cache-repair/glm_api_cache_router.py --port "$PORT" \
   --control-url "http://127.0.0.1:$CONTROL" \
   --shared-cache-path /run/glm-tokenizer/segments.sqlite3 "${SOCKETS[@]}"
@@ -219,11 +206,11 @@ docker run -d --init --name "$PROJECT-api-router-$NODE" --pull=never --network h
 
 ## 外层Router：81
 
-配置中的KV容量为原server_info快照；原router.sh启动时从各网关server_info读取。max_seqs按本文件目标配置填写。
+kv_tokens取本次server_info实测值，max_seqs=32。
 
 ~~~bash
 cat > "$WORK/config/router-token-balance.json" <<'JSON'
-{"tokenizer_path":"/model/tokenizer.json","kv_fraction":0.85,"workers":{"http://11.5.0.81:32110":{"kv_tokens":3957034,"max_seqs":32},"http://11.5.0.83:32110":{"kv_tokens":3957034,"max_seqs":32},"http://11.5.0.84:32110":{"kv_tokens":3957034,"max_seqs":32},"http://11.5.0.85:32111":{"kv_tokens":4094804,"max_seqs":32}}}
+{"tokenizer_path":"/model/tokenizer.json","kv_fraction":0.85,"workers":{"http://11.5.0.81:32110":{"kv_tokens":4630572,"max_seqs":32},"http://11.5.0.83:32110":{"kv_tokens":4630572,"max_seqs":32},"http://11.5.0.84:32110":{"kv_tokens":4630572,"max_seqs":32},"http://11.5.0.85:32111":{"kv_tokens":5763341,"max_seqs":32}}}
 JSON
 docker run -d --init --name "$PROJECT-router-81" --pull=never --network host \
   --log-opt max-size=128m --log-opt max-file=5 --label ai-infra.project="$PROJECT" \
@@ -242,27 +229,9 @@ docker run -d --init --name "$PROJECT-router-81" --pull=never --network host \
   --request-timeout-secs 1800 --worker-startup-timeout-secs 7200
 ~~~
 
-## 当前压测参数
+## 服务入口
 
-| 参数 | 值 |
-| --- | --- |
-| 数据集 | swe-maxtpm-130k-candidate.jsonl，前1536条完整会话，144140参考轮 |
-| 并发 / 活跃会话上限 | 718 / 1024 |
-| 流式 / timeout / max_tokens | true / 1800秒 / 4096 |
-| temperature / cache_salt_enabled | 0 / true |
-| maxtpm_start_percent | 53 |
-| reasoning_effort / enable_thinking请求覆盖 | 未显式设置 |
-| 每百万输入 / 缓存输入 / 输出估算价 | 0.16 / 0.046 / 0.56元，已乘0.2 |
-| API | http://11.5.0.81:38080/v1 |
-
-## 现有脚本入口
-
-| 主机 | 脚本（位于WORK） |
-| --- | --- |
-| 81 | mooncake-master.sh、mooncake-store-81.sh、prefill-81-0.sh、api-router-81.sh、router.sh |
-| 83、84 | mooncake-store-{NODE}.sh、prefill-{NODE}-0.sh、api-router-{NODE}.sh |
-| 85 | mooncake-store-85.sh、decode-85.sh、api-router-85.sh |
-| 86、87、88 | mooncake-store-{NODE}.sh、decode-{NODE}.sh |
+http://11.5.0.81:38080/v1
 
 ## 镜像构建
 

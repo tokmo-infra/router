@@ -15,7 +15,7 @@
 | P max-num-batched-tokens | 2048/DP | 2048/DP |
 | D max-num-batched-tokens | 1024/DP | 1024/DP |
 | gpu-memory-utilization | P/D均0.95 | P/D均0.95 |
-| P compilation-config.cudagraph_mode | 未显式覆盖 | NONE |
+| P compilation-config | 未显式覆盖 | FULL_DECODE_ONLY，max_cudagraph_capture_size=256 |
 | D compilation-config | FULL_DECODE_ONLY，max_cudagraph_capture_size=64 | FULL_DECODE_ONLY，max_cudagraph_capture_size=128 |
 | P api-server-count | 每EP4实例4 | 每EP8实例4 |
 | D api-server-count | 每EP8实例1 | D85为8；86—88为0 |
@@ -38,8 +38,8 @@
 | API亲和代理 / VLLM_API_PRIVATE_SOCKET_DIR | 未启用 | 32110/32111网关＋/run/glm-tokenizer私有socket |
 | Mooncake global_segment_size | 每台805306368000（750GiB），共2250GiB | 每台805306368000（750GiB），共5250GiB |
 | Mooncake GPU客户端local_buffer_size | 每rank2147483648 | P每rank536870912；D每rank2147483648 |
-| Mooncake enable_offload / offload_on_evict | false / 未启用 | Store/master true / true；GPU客户端仍false |
-| L3容量 | 关闭 | P每台1TiB，D每台3TiB，共15TiB |
+| Mooncake enable_offload / offload_on_evict | false / 未启用 | Store/master false / false；GPU客户端false |
+| L3容量 | 关闭 | 关闭 |
 | remote_store_read_batch_bytes | 未设置 | 67108864 |
 | placement_segments | 未设置，local_first | P首选权重1、D权重3，保留全局回退 |
 | kv_load_failure_policy | fail | recompute |
