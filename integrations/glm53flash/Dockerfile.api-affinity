@@ -1,0 +1,4 @@
+ARG BASE_IMAGE=sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7
+FROM ${BASE_IMAGE}
+COPY integrations/glm53flash/api_affinity.py /opt/api-affinity/api_affinity.py
+ENTRYPOINT ["python3", "/opt/api-affinity/api_affinity.py"]
