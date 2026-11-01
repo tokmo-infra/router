@@ -43,14 +43,5 @@
     "pd_usage_cases": 12,
     "kv_hash_cases": 6
   },
-  "current_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT.md",
-  "optional_api_affinity": {
-    "source": "integrations/glm53flash/api_affinity.py",
-    "dockerfile": "integrations/glm53flash/Dockerfile.api-affinity",
-    "default": "separate optional CPU proxy; Rust outer router unchanged",
-    "paired_vllm_env": "VLLM_API_PRIVATE_SOCKET_DIR",
-    "body_and_rank": "unchanged forwarding",
-    "streams": "async raw SSE with cancellation and backpressure",
-    "C230_validation": "run-27dce16ab0f3;21727 successful,0 failed"
-  }
+  "current_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT.md"
 }
