@@ -96,6 +96,7 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
     eviction_handle: Option<thread::JoinHandle<()>>,
+    coupled_kv: Option<super::coupled_kv::CoupledKv>,
 }
 
 impl CacheAwarePolicy {
@@ -134,6 +135,7 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+            coupled_kv: super::coupled_kv::CoupledKv::from_env(),
         }
     }
 
@@ -301,6 +303,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
+        if let Some(balance) = &self.coupled_kv {
+            let idx = balance.select(workers)?;
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[idx].url());
+            RouterMetrics::record_policy_decision("coupled_kv", workers[idx].url());
+            return Some(idx);
+        }
 
         if healthy_indices.is_empty() {
             return None;
