@@ -687,6 +687,9 @@ impl VllmPDRouter {
     ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
+        if Self::reuse_prefill_prompt_ids(path) {
+            request["return_token_ids"] = json!(true);
+        }
         if path.contains("inference/v1/generate") {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
@@ -727,6 +730,24 @@ impl VllmPDRouter {
             obj.remove("stream_options");
         }
         request
+    }
+
+    fn reuse_prefill_prompt_ids(path: &str) -> bool {
+        path == "/v1/chat/completions"
+            && std::env::var("VLLM_ROUTER_PD_REUSE_PROMPT_IDS").as_deref() == Ok("1")
+    }
+
+    fn attach_prefill_prompt_ids(response: &Value, params: &mut Value) -> Result<(), String> {
+        let ids = response.get("prompt_token_ids").filter(|value| {
+            value.as_array().is_some_and(|ids| {
+                !ids.is_empty()
+                    && ids.iter().all(|id| id.as_u64().is_some_and(|id| u32::try_from(id).is_ok()))
+            })
+        }).ok_or("Prefill response has no valid prompt_token_ids")?;
+        params.as_object_mut().ok_or("Prefill returned no KV transfer metadata")?
+            .insert("prompt_token_ids".into(), ids.clone());
+        metrics::counter!("vllm_router_pd_prompt_ids_reused_total").increment(1);
+        Ok(())
     }
 
     /// Convert service discovery instances to Worker objects for policy selection
@@ -1044,12 +1065,12 @@ impl VllmPDRouter {
 
         // Concurrent dispatch: MoRI-IO WRITE mode, or NIXL push once the
         // prefill identity is known.
-        let is_concurrent_dispatch = (matches!(self.kv_connector, KvConnector::MoriIO)
+        let is_concurrent_dispatch = !Self::reuse_prefill_prompt_ids(path) && ((matches!(self.kv_connector, KvConnector::MoriIO)
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)))
             || (matches!(self.kv_connector, KvConnector::Nixl)
                 && self
                     .get_nixl_push_identity(&prefill_url_key, prefill_dp_rank)
-                    .is_some());
+                    .is_some()));
 
         let needs_logprobs = request_json.get("logprobs").is_some()
             || request_json
@@ -1149,7 +1170,7 @@ impl VllmPDRouter {
 
         // Prepare decode request
         let mut decode_request = request_json.clone();
-        if let Some(params) = self
+        if let Some(mut params) = self
             .build_decode_kv_transfer_params(
                 &prefill_url_key,
                 prefill_response_json.as_ref(),
@@ -1159,11 +1180,19 @@ impl VllmPDRouter {
             )
             .await
         {
+            if Self::reuse_prefill_prompt_ids(path) {
+                Self::attach_prefill_prompt_ids(
+                    prefill_response_json.as_ref().ok_or("Missing prefill response for token-ID reuse")?,
+                    &mut params,
+                )?;
+            }
             decode_request["kv_transfer_params"] = params;
             debug!(
                 "Added kv_transfer_params to decode request for {:?} connector",
                 self.kv_connector
             );
+        } else if Self::reuse_prefill_prompt_ids(path) {
+            return Err("Missing prefill KV metadata for token-ID reuse".into());
         }
 
         if matches!(self.kv_connector, KvConnector::Mooncake)
@@ -1604,7 +1633,7 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
-        if let Some(params) = self
+        if let Some(mut params) = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
                 Some(&prefill_response_json),
@@ -1614,8 +1643,17 @@ impl VllmPDRouter {
             )
             .await
         {
+            if Self::reuse_prefill_prompt_ids(path) {
+                Self::attach_prefill_prompt_ids(&prefill_response_json, &mut params)
+                    .map_err(|message| PDRouterError::NetworkError { message })?;
+            }
             decode_request["kv_transfer_params"] = params;
         } else {
+            if Self::reuse_prefill_prompt_ids(path) {
+                return Err(PDRouterError::NetworkError {
+                    message: "Missing prefill KV metadata for token-ID reuse".into(),
+                });
+            }
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
@@ -1808,6 +1846,10 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
+        // Decode needs the completed P response before it can reuse prompt IDs.
+        if Self::reuse_prefill_prompt_ids(path) {
+            return None;
+        }
         if !matches!(self.kv_connector, KvConnector::Nixl) {
             return None;
         }
