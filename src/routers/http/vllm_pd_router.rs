@@ -68,8 +68,9 @@ pub struct VllmPDRouter {
     prefill_dp_round_robin: Arc<AtomicUsize>,
     /// KV connector type
     kv_connector: KvConnector,
-    /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
-    mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Populated before the router is published and immutable during requests.
+    /// Do not serialize P->D handoffs through an async mutex for this lookup.
+    mooncake_prefill_info: HashMap<String, MooncakePrefillInfo>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
 }
@@ -363,7 +364,7 @@ impl VllmPDRouter {
 
     /// Build decode kv_transfer_params for all connectors. Returns `None` if params cannot be
     /// determined (e.g. Mooncake bootstrap info missing, or no kv_transfer_params in prefill response).
-    async fn build_decode_kv_transfer_params(
+    fn build_decode_kv_transfer_params(
         &self,
         prefill_url: &str,
         prefill_response_json: Option<&Value>,
@@ -375,7 +376,6 @@ impl VllmPDRouter {
             KvConnector::Mooncake => {
                 let Some((bootstrap_addr, engine_id)) = self
                     .get_mooncake_info(prefill_url, prefill_dp_rank.map(|r| r as usize))
-                    .await
                 else {
                     warn!(
                         "No Mooncake bootstrap info for prefill {}, decode will proceed without kv_transfer_params",
@@ -464,12 +464,12 @@ impl VllmPDRouter {
     }
 
     /// Look up Mooncake prefill info for a given prefill URL and dp_rank
-    async fn get_mooncake_info(
+    fn get_mooncake_info(
         &self,
         prefill_url: &str,
         dp_rank: Option<usize>,
     ) -> Option<(String, String)> {
-        let info = self.mooncake_prefill_info.lock().await;
+        let info = &self.mooncake_prefill_info;
         if let Some(prefill_info) = info.get(prefill_url) {
             let rank = dp_rank.unwrap_or(0);
             if let Some(engine_id) = prefill_info.dp_engine_ids.get(&rank) {
@@ -687,6 +687,9 @@ impl VllmPDRouter {
     ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
+        if Self::reuse_prefill_prompt_ids(path) {
+            request["return_token_ids"] = json!(true);
+        }
         if path.contains("inference/v1/generate") {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
@@ -720,6 +723,17 @@ impl VllmPDRouter {
                 }
             }
         }
+        // Mooncake publishes producer-ready KV only for length-capped P
+        // requests. An EOS/stop here must not strand the subsequent D pull.
+        // Apply this only to the P copy; decode keeps the caller's policy.
+        if matches!(path, "/v1/chat/completions" | "/v1/completions")
+            && std::env::var("VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP").as_deref() == Ok("1")
+        {
+            request["min_tokens"] = json!(1);
+            request["ignore_eos"] = json!(true);
+            request["stop"] = Value::Null;
+            request["stop_token_ids"] = json!([]);
+        }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
         // Remove stream_options since we're setting stream=false
@@ -727,6 +741,24 @@ impl VllmPDRouter {
             obj.remove("stream_options");
         }
         request
+    }
+
+    fn reuse_prefill_prompt_ids(path: &str) -> bool {
+        path == "/v1/chat/completions"
+            && std::env::var("VLLM_ROUTER_PD_REUSE_PROMPT_IDS").as_deref() == Ok("1")
+    }
+
+    fn attach_prefill_prompt_ids(response: &Value, params: &mut Value) -> Result<(), String> {
+        let ids = response.get("prompt_token_ids").filter(|value| {
+            value.as_array().is_some_and(|ids| {
+                !ids.is_empty()
+                    && ids.iter().all(|id| id.as_u64().is_some_and(|id| u32::try_from(id).is_ok()))
+            })
+        }).ok_or("Prefill response has no valid prompt_token_ids")?;
+        params.as_object_mut().ok_or("Prefill returned no KV transfer metadata")?
+            .insert("prompt_token_ids".into(), ids.clone());
+        metrics::counter!("vllm_router_pd_prompt_ids_reused_total").increment(1);
+        Ok(())
     }
 
     /// Convert service discovery instances to Worker objects for policy selection
@@ -1044,12 +1076,12 @@ impl VllmPDRouter {
 
         // Concurrent dispatch: MoRI-IO WRITE mode, or NIXL push once the
         // prefill identity is known.
-        let is_concurrent_dispatch = (matches!(self.kv_connector, KvConnector::MoriIO)
+        let is_concurrent_dispatch = !Self::reuse_prefill_prompt_ids(path) && ((matches!(self.kv_connector, KvConnector::MoriIO)
             && matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)))
             || (matches!(self.kv_connector, KvConnector::Nixl)
                 && self
                     .get_nixl_push_identity(&prefill_url_key, prefill_dp_rank)
-                    .is_some());
+                    .is_some()));
 
         let needs_logprobs = request_json.get("logprobs").is_some()
             || request_json
@@ -1149,7 +1181,7 @@ impl VllmPDRouter {
 
         // Prepare decode request
         let mut decode_request = request_json.clone();
-        if let Some(params) = self
+        if let Some(mut params) = self
             .build_decode_kv_transfer_params(
                 &prefill_url_key,
                 prefill_response_json.as_ref(),
@@ -1157,13 +1189,20 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|r| r as u32),
                 Some(&request_id),
             )
-            .await
         {
+            if Self::reuse_prefill_prompt_ids(path) {
+                Self::attach_prefill_prompt_ids(
+                    prefill_response_json.as_ref().ok_or("Missing prefill response for token-ID reuse")?,
+                    &mut params,
+                )?;
+            }
             decode_request["kv_transfer_params"] = params;
             debug!(
                 "Added kv_transfer_params to decode request for {:?} connector",
                 self.kv_connector
             );
+        } else if Self::reuse_prefill_prompt_ids(path) {
+            return Err("Missing prefill KV metadata for token-ID reuse".into());
         }
 
         if matches!(self.kv_connector, KvConnector::Mooncake)
@@ -1604,7 +1643,7 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
-        if let Some(params) = self
+        if let Some(mut params) = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
                 Some(&prefill_response_json),
@@ -1612,10 +1651,18 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|r| r as u32),
                 Some(&request_id),
             )
-            .await
         {
+            if Self::reuse_prefill_prompt_ids(path) {
+                Self::attach_prefill_prompt_ids(&prefill_response_json, &mut params)
+                    .map_err(|message| PDRouterError::NetworkError { message })?;
+            }
             decode_request["kv_transfer_params"] = params;
         } else {
+            if Self::reuse_prefill_prompt_ids(path) {
+                return Err(PDRouterError::NetworkError {
+                    message: "Missing prefill KV metadata for token-ID reuse".into(),
+                });
+            }
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
@@ -1808,6 +1855,10 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
+        // Decode needs the completed P response before it can reuse prompt IDs.
+        if Self::reuse_prefill_prompt_ids(path) {
+            return None;
+        }
         if !matches!(self.kv_connector, KvConnector::Nixl) {
             return None;
         }
@@ -2033,7 +2084,7 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
-                mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                mooncake_prefill_info: HashMap::new(),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 decode_admission: parking_lot::Mutex::new(()),
                 token_balancer: TokenBalancer::from_env()?,
@@ -2075,7 +2126,7 @@ impl VllmPDRouter {
             }
 
             // Query Mooncake bootstrap servers if kv_connector is mooncake
-            let mooncake_prefill_info = Arc::new(Mutex::new(HashMap::new()));
+            let mut mooncake_prefill_info = HashMap::new();
             if matches!(kv_connector, KvConnector::Mooncake) {
                 info!("Mooncake connector enabled, querying prefill bootstrap servers...");
                 for (url, bootstrap_port) in &prefill_urls {
@@ -2101,7 +2152,7 @@ impl VllmPDRouter {
                                 "Got Mooncake engine_ids for {}: {:?}",
                                 base_url, dp_engine_ids
                             );
-                            mooncake_prefill_info.lock().await.insert(
+                            mooncake_prefill_info.insert(
                                 base_url,
                                 MooncakePrefillInfo {
                                     bootstrap_addr,
