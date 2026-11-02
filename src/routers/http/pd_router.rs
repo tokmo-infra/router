@@ -6,7 +6,7 @@ use super::pd_types::{
     Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
     PdSelection, Stage, StageDecision,
 };
-use crate::backend::preprocess::prepare_http_token_inputs;
+use crate::backend::preprocess::{http_preparation_budget, prepare_http_token_inputs};
 use crate::core::worker::WorkerMetadata;
 use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
@@ -481,7 +481,7 @@ impl PdRouterBase {
             route,
             headers,
             self.api_key.as_deref(),
-            Duration::from_secs(1),
+            http_preparation_budget(Duration::from_secs(1)),
         )
         .await;
         Some(

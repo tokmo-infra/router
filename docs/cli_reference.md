@@ -39,6 +39,10 @@ and non-append list options.
 
 The Rust HTTP backend connection pool has a two-second idle timeout by default; `--pool-idle-timeout-secs 0` disables reuse. This is a Rust-only CLI option.
 
+For high-concurrency PD, use `--pool-idle-timeout-secs 600` to retain connections across multi-turn gaps. The per-host idle connection limit follows `max(500, --max-concurrent-requests)` so burst completions do not immediately discard most connections. The incoming TCP listener requests a backlog of 4096; the operating system's listen-queue limit still applies.
+
+A homogeneous single-model PD deployment can opt into shared HTTP token preparation with `AI_INFRA_HTTP_RENDER_HOMOGENEOUS=1` after verifying identical effective token IDs from every P's `/render` endpoint. It renders once, shares the IDs for native `cache_aware` selection, and follows the previously selected P for the same model/cache salt. Heterogeneous workers keep the default per-worker rendering. `AI_INFRA_HTTP_PREPARATION_BUDGET_SECS` sets the preparation budget (1–600 seconds). `AI_INFRA_CACHE_AWARE_REQUIRE_TOKENS=1` rejects missing token preparation instead of silently falling back. `AI_INFRA_PD_REUSE_PROMPT_IDS=1` passes native P prompt IDs into D's existing KV-transfer input; it requires P responses with valid `prompt_token_ids`.
+
 Rust integer types are unsigned: `u16` is 0–65535, `u32` is 0–4294967295,
 `u64` is 0–18446744073709551615, and `usize` depends on the target pointer
 width. `f32` and `f64` are floating-point values. Python's `integer` and

@@ -39,7 +39,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpSocket, TcpStream},
     signal, spawn,
     sync::RwLock,
 };
@@ -972,7 +972,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     println!("DEBUG: Creating HTTP client");
     let mut client_builder = Client::builder()
-        .pool_max_idle_per_host(500)
+        .pool_max_idle_per_host(config.router_config.max_concurrent_requests.max(500))
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .tcp_nodelay(true)
@@ -1222,7 +1222,36 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 async fn bind_listener(
     addr: &str,
 ) -> std::io::Result<impl Listener<Io = TcpStream, Addr = SocketAddr>> {
-    let listener = TcpListener::bind(addr).await?;
+    let mut last_error = None;
+    let mut bound = None;
+    for address in tokio::net::lookup_host(addr).await? {
+        let result = (|| {
+            let socket = if address.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            #[cfg(unix)]
+            socket.set_reuseaddr(true)?;
+            socket.bind(address)?;
+            socket.listen(4096)
+        })();
+        match result {
+            Ok(listener) => {
+                bound = Some(listener);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let listener = bound.ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no socket addresses resolved",
+            )
+        })
+    })?;
     Ok(listener.tap_io(|tcp| {
         if let Err(err) = tcp.set_nodelay(true) {
             warn!("Failed to set TCP_NODELAY on incoming connection: {err}");
@@ -1290,6 +1319,21 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_bind_listener_accepts_a_burst_larger_than_128_before_polling() {
+        let listener = bind_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Keep every connection alive while the accept loop is deliberately idle.
+        let clients = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::try_join_all((0..192).map(|_| TcpStream::connect(address))),
+        )
+        .await
+        .expect("the listener backlog must absorb the complete burst")
+        .unwrap();
+        assert_eq!(clients.len(), 192);
+    }
 
     #[tokio::test]
     async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {

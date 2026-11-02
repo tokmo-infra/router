@@ -148,6 +148,39 @@ pub(crate) struct HttpTokenInput {
     pub source: &'static str,
 }
 
+/// Task-local limits; upstream behavior is unchanged when no override is set.
+pub(crate) fn http_preparation_budget(default: Duration) -> Duration {
+    std::env::var("AI_INFRA_HTTP_PREPARATION_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=600).contains(value))
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+static HTTP_RENDER_AFFINITY: std::sync::OnceLock<DashMap<[u8; 32], String>> =
+    std::sync::OnceLock::new();
+
+fn http_render_identity(body: &serde_json::Value) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let salt = body.get("cache_salt")?.as_str()?;
+    let identity = serde_json::to_vec(&(body.get("model"), salt)).ok()?;
+    Some(Sha256::digest(identity).into())
+}
+
+pub(crate) fn record_http_render_affinity(body: &serde_json::Value, base: &str) {
+    if std::env::var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS").as_deref() != Ok("1") {
+        return;
+    }
+    if let Some(key) = http_render_identity(body) {
+        let affinity = HTTP_RENDER_AFFINITY.get_or_init(DashMap::new);
+        // The measured workload has 12000 live sessions; bound stale history.
+        if affinity.len() < 32768 || affinity.contains_key(&key) {
+            affinity.insert(key, base.to_owned());
+        }
+    }
+}
+
 pub(crate) async fn prepare_http_token_inputs(
     client: &Client,
     mut urls: Vec<String>,
@@ -194,6 +227,33 @@ pub(crate) async fn prepare_http_token_inputs(
         1
     };
     let tokenize_fallback = std::sync::OnceLock::new();
+    // Only enable after verifying that all eight P endpoints have the same
+    // model, tokenizer, template/options and effective render contract. The
+    // native cache-aware selector still consumes backend-effective token IDs;
+    // only the redundant per-candidate HTTP preparation is shared.
+    let homogeneous =
+        std::env::var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS").as_deref() == Ok("1") && urls.len() > 1;
+    let all_urls = urls.clone();
+    if homogeneous {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_RENDER: AtomicUsize = AtomicUsize::new(0);
+        // Follow the P endpoint selected by the native cache-aware policy on
+        // the previous turn. This keeps its private CPU segment caches warm;
+        // the policy still independently chooses the actual prefill worker.
+        let index = http_render_identity(body)
+            .map(|key| {
+                HTTP_RENDER_AFFINITY
+                    .get_or_init(DashMap::new)
+                    .get(&key)
+                    .and_then(|base| urls.iter().position(|url| url == base.value()))
+                    .unwrap_or_else(|| {
+                        u64::from_le_bytes(key[..8].try_into().unwrap()) as usize % urls.len()
+                    })
+            })
+            .unwrap_or_else(|| NEXT_RENDER.fetch_add(1, Ordering::Relaxed) % urls.len());
+        urls = vec![urls.swap_remove(index)];
+    }
+    let selected_url = urls.first().cloned();
     let mut inputs: std::collections::HashMap<_, _> = urls
         .iter()
         .map(|url| (url.clone(), Err("preparation_unavailable")))
@@ -251,6 +311,24 @@ pub(crate) async fn prepare_http_token_inputs(
     while let Ok(Some((url, result))) = tokio::time::timeout_at(deadline, results.next()).await {
         inputs.insert(url, result);
     }
+    if homogeneous {
+        let result = selected_url
+            .and_then(|url| inputs.remove(&url))
+            .unwrap_or(Err("preparation_unavailable"));
+        return all_urls
+            .into_iter()
+            .map(|url| {
+                let shared = match &result {
+                    Ok(input) => Ok(HttpTokenInput {
+                        prompts: input.prompts.clone(),
+                        source: "render_homogeneous",
+                    }),
+                    Err(reason) => Err(*reason),
+                };
+                (url, shared)
+            })
+            .collect();
+    }
     inputs
 }
 
@@ -264,7 +342,7 @@ async fn http_input_json(
 ) -> Result<serde_json::Value, &'static str> {
     let mut request = client
         .post(format!("{}{path}", base.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(http_preparation_budget(Duration::from_secs(5)))
         .json(body);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
@@ -877,6 +955,64 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[tokio::test]
+    async fn ai_infra_homogeneous_render_is_one_rpc_and_shares_exact_ids() {
+        use super::{prepare_http_token_inputs, record_http_render_affinity};
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/{worker}/v1/chat/completions/render",
+            post(
+                move |axum::extract::Path(worker): axum::extract::Path<String>,
+                      Json(body): Json<serde_json::Value>| {
+                    let calls = observed.clone();
+                    async move {
+                        assert_eq!(
+                            worker, "b",
+                            "Render must follow the previous actual P placement"
+                        );
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+                        Json(json!({"token_ids": [7, 8, 9]}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let urls = vec![format!("{base}/a"), format!("{base}/b")];
+        let body = json!({"model": "test", "cache_salt": "affinity-test",
+                          "messages": [{"role": "user", "content": "long prefix"}],
+                          "tools": [{"type": "function", "function": {"name": "lookup"}}]});
+        std::env::set_var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS", "1");
+        record_http_render_affinity(&body, &urls[1]);
+        let results = prepare_http_token_inputs(
+            &reqwest::Client::new(),
+            urls.clone(),
+            &body,
+            "/v1/chat/completions",
+            None,
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        std::env::remove_var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let first = results[&urls[0]].as_ref().unwrap();
+        let second = results[&urls[1]].as_ref().unwrap();
+        assert_eq!(first.prompts.as_ref(), &[vec![7, 8, 9]]);
+        assert!(Arc::ptr_eq(&first.prompts, &second.prompts));
+        assert_eq!(first.source, "render_homogeneous");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
         use super::prepare_http_token_inputs;

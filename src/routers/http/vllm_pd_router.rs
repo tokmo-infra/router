@@ -785,6 +785,9 @@ impl VllmPDRouter {
     ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
+        if Self::reuse_prefill_prompt_ids(path) {
+            request["return_token_ids"] = json!(true);
+        }
         if path.contains("inference/v1/generate") {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
@@ -814,6 +817,31 @@ impl VllmPDRouter {
             obj.remove("stream_options");
         }
         request
+    }
+
+    fn reuse_prefill_prompt_ids(path: &str) -> bool {
+        path == "/v1/chat/completions"
+            && std::env::var("AI_INFRA_PD_REUSE_PROMPT_IDS").as_deref() == Ok("1")
+    }
+
+    fn attach_prefill_prompt_ids(response: &Value, params: &mut Value) -> Result<(), String> {
+        let ids = response
+            .get("prompt_token_ids")
+            .filter(|value| {
+                value.as_array().is_some_and(|ids| {
+                    !ids.is_empty()
+                        && ids
+                            .iter()
+                            .all(|id| id.as_u64().is_some_and(|id| u32::try_from(id).is_ok()))
+                })
+            })
+            .ok_or("Prefill response has no valid prompt_token_ids")?;
+        params
+            .as_object_mut()
+            .ok_or("Prefill returned no KV transfer metadata")?
+            .insert("prompt_token_ids".into(), ids.clone());
+        RouterMetrics::record_kv_routing_input("pd", "prefill_prompt_ids_reused");
+        Ok(())
     }
 
     fn discovery_candidates(
@@ -942,6 +970,18 @@ impl VllmPDRouter {
             })
             .collect();
         let decode_tokens = decode_inputs.unwrap_or_default();
+        // This deployment requires real cache-aware decisions. Never silently
+        // change its policy to least-load when HTTP token preparation fails.
+        if prefill_policy.name() == "cache_aware"
+            && std::env::var("AI_INFRA_CACHE_AWARE_REQUIRE_TOKENS").as_deref() == Ok("1")
+            && prefill_workers
+                .iter()
+                .filter(|worker| worker.is_available())
+                .any(|worker| !prefill_tokens.contains_key(worker.base_url()))
+        {
+            RouterMetrics::record_pd_error("cache_aware_token_preparation");
+            return None;
+        }
         let [prefill_cache, decode_cache] = [
             (prefill_policy.as_ref(), prefill_workers, &prefill_tokens),
             (decode_policy.as_ref(), decode_workers, &decode_tokens),
@@ -977,6 +1017,13 @@ impl VllmPDRouter {
         // inferred from KV overlap or DP rank equality.
         self.pd_router
             .select_and_admit(prefill_workers, decode_workers, &context)
+            .map(|(selection, attempt)| {
+                crate::backend::preprocess::record_http_render_affinity(
+                    request,
+                    prefill_workers[selection.prefill.worker_index].base_url(),
+                );
+                (selection, attempt)
+            })
     }
 
     /// Cheap opt-in gate: only Program-capable requests are serialized twice.
@@ -1627,7 +1674,7 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        if let Some(params) = self
+        if let Some(mut params) = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
                 Some(&prefill_response_json),
@@ -1638,8 +1685,17 @@ impl VllmPDRouter {
             )
             .await
         {
+            if Self::reuse_prefill_prompt_ids(path) {
+                Self::attach_prefill_prompt_ids(&prefill_response_json, &mut params)
+                    .map_err(|message| PDRouterError::NetworkError { message })?;
+            }
             decode_request["kv_transfer_params"] = params;
         } else {
+            if Self::reuse_prefill_prompt_ids(path) {
+                return Err(PDRouterError::NetworkError {
+                    message: "Prefill returned no KV transfer metadata for token-ID reuse".into(),
+                });
+            }
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
@@ -1742,6 +1798,10 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
+        // Native D reuse requires P's completed prompt IDs before dispatch.
+        if Self::reuse_prefill_prompt_ids(path) {
+            return None;
+        }
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
         let concurrent = match self.kv_connector {
@@ -2582,6 +2642,31 @@ impl WorkerManagement for VllmPDRouter {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    #[test]
+    fn ai_infra_prompt_id_handoff_preserves_kv_and_rejects_corrupt_ids() {
+        let response = json!({"prompt_token_ids": [3, 7, 9]});
+        let mut params = json!({"do_remote_prefill": true, "remote_engine_id": "engine",
+                                "remote_block_ids": [11, 12]});
+        VllmPDRouter::attach_prefill_prompt_ids(&response, &mut params).unwrap();
+        assert_eq!(params["prompt_token_ids"], json!([3, 7, 9]));
+        assert_eq!(params["remote_block_ids"], json!([11, 12]));
+        assert_eq!(params["remote_engine_id"], "engine");
+        for ids in [
+            json!(null),
+            json!([]),
+            json!([true]),
+            json!([-1]),
+            json!([4294967296_u64]),
+            json!(["3"]),
+        ] {
+            let response = json!({"prompt_token_ids": ids});
+            let mut metadata = json!({"do_remote_prefill": true});
+            assert!(VllmPDRouter::attach_prefill_prompt_ids(&response, &mut metadata).is_err());
+            assert_eq!(metadata, json!({"do_remote_prefill": true}));
+        }
+        assert!(VllmPDRouter::attach_prefill_prompt_ids(&response, &mut json!(null)).is_err());
+    }
+
     async fn finalize_decode_response(
         response: reqwest::Response,
         prefill: Option<&Value>,
