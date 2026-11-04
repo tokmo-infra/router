@@ -723,6 +723,17 @@ impl VllmPDRouter {
                 }
             }
         }
+        // Mooncake publishes producer-ready KV only for length-capped P
+        // requests. An EOS/stop here must not strand the subsequent D pull.
+        // Apply this only to the P copy; decode keeps the caller's policy.
+        if matches!(path, "/v1/chat/completions" | "/v1/completions")
+            && std::env::var("VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP").as_deref() == Ok("1")
+        {
+            request["min_tokens"] = json!(1);
+            request["ignore_eos"] = json!(true);
+            request["stop"] = Value::Null;
+            request["stop_token_ids"] = json!([]);
+        }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
         // Remove stream_options since we're setting stream=false
