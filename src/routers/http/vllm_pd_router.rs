@@ -68,8 +68,9 @@ pub struct VllmPDRouter {
     prefill_dp_round_robin: Arc<AtomicUsize>,
     /// KV connector type
     kv_connector: KvConnector,
-    /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
-    mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Populated before the router is published and immutable during requests.
+    /// Do not serialize P->D handoffs through an async mutex for this lookup.
+    mooncake_prefill_info: HashMap<String, MooncakePrefillInfo>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
 }
@@ -363,7 +364,7 @@ impl VllmPDRouter {
 
     /// Build decode kv_transfer_params for all connectors. Returns `None` if params cannot be
     /// determined (e.g. Mooncake bootstrap info missing, or no kv_transfer_params in prefill response).
-    async fn build_decode_kv_transfer_params(
+    fn build_decode_kv_transfer_params(
         &self,
         prefill_url: &str,
         prefill_response_json: Option<&Value>,
@@ -375,7 +376,6 @@ impl VllmPDRouter {
             KvConnector::Mooncake => {
                 let Some((bootstrap_addr, engine_id)) = self
                     .get_mooncake_info(prefill_url, prefill_dp_rank.map(|r| r as usize))
-                    .await
                 else {
                     warn!(
                         "No Mooncake bootstrap info for prefill {}, decode will proceed without kv_transfer_params",
@@ -464,12 +464,12 @@ impl VllmPDRouter {
     }
 
     /// Look up Mooncake prefill info for a given prefill URL and dp_rank
-    async fn get_mooncake_info(
+    fn get_mooncake_info(
         &self,
         prefill_url: &str,
         dp_rank: Option<usize>,
     ) -> Option<(String, String)> {
-        let info = self.mooncake_prefill_info.lock().await;
+        let info = &self.mooncake_prefill_info;
         if let Some(prefill_info) = info.get(prefill_url) {
             let rank = dp_rank.unwrap_or(0);
             if let Some(engine_id) = prefill_info.dp_engine_ids.get(&rank) {
@@ -1189,7 +1189,6 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|r| r as u32),
                 Some(&request_id),
             )
-            .await
         {
             if Self::reuse_prefill_prompt_ids(path) {
                 Self::attach_prefill_prompt_ids(
@@ -1652,7 +1651,6 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|r| r as u32),
                 Some(&request_id),
             )
-            .await
         {
             if Self::reuse_prefill_prompt_ids(path) {
                 Self::attach_prefill_prompt_ids(&prefill_response_json, &mut params)
@@ -2086,7 +2084,7 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
-                mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                mooncake_prefill_info: HashMap::new(),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 decode_admission: parking_lot::Mutex::new(()),
                 token_balancer: TokenBalancer::from_env()?,
@@ -2128,7 +2126,7 @@ impl VllmPDRouter {
             }
 
             // Query Mooncake bootstrap servers if kv_connector is mooncake
-            let mooncake_prefill_info = Arc::new(Mutex::new(HashMap::new()));
+            let mut mooncake_prefill_info = HashMap::new();
             if matches!(kv_connector, KvConnector::Mooncake) {
                 info!("Mooncake connector enabled, querying prefill bootstrap servers...");
                 for (url, bootstrap_port) in &prefill_urls {
@@ -2154,7 +2152,7 @@ impl VllmPDRouter {
                                 "Got Mooncake engine_ids for {}: {:?}",
                                 base_url, dp_engine_ids
                             );
-                            mooncake_prefill_info.lock().await.insert(
+                            mooncake_prefill_info.insert(
                                 base_url,
                                 MooncakePrefillInfo {
                                     bootstrap_addr,
