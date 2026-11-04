@@ -2,9 +2,9 @@
   "name": "glm5.3-flash-1103",
   "router_version": "0.1.16",
   "source_base": "db02f358da401b60d4ae14eb286163763a0705cc",
-  "source_snapshot": "48740d2ad97f734a8846cc5679668b744c237dc1",
-  "deployed_image": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
-  "deployed_binary_sha256": "64361aa391fae97c996880c48726218fd96aad90e038db1470f4f5c90898b857",
+  "source_snapshot": "08d7195149fda3fc0ef7efbdb2c92dd787fcf60e",
+  "deployed_image": "sha256:c07f71ef603b3c28c2f2b48e0657c4c96fcee285428dcd64747ed53a3d3aeec5",
+  "deployed_binary_sha256": "6c51e70abc6a668a716b4738f448b5c2034559d63c3fe2c18d73352a95f99448",
   "source_files": [
     {
       "path": "Cargo.lock",
@@ -52,10 +52,14 @@
     },
     {
       "path": "src/routers/http/vllm_pd_router.rs",
-      "sha256": "5e3ad235309ec5eb38729ccef429433cceab8dd55a35434176ba9b92224303e1"
+      "sha256": "572beacbaefc29e87037165014e2ebe9ef6eb54b4250db725f9754c0e5b108b5"
     }
   ],
   "vllm_repository": "https://github.com/tokmo-infra/vllm",
   "vllm_branch": "glm5.3-flash-1103",
-  "router_deployment": "DEPLOYMENT.md"
+  "router_deployment": "DEPLOYMENT.md",
+  "default_features": {
+    "pd_reuse_prompt_ids": true
+  },
+  "vllm_deployment": "deployment4p4d.md"
 }
