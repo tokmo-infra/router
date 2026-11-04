@@ -32,7 +32,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -45,6 +44,11 @@ use tokio::{
 };
 use tracing::{error, info, warn, Level};
 
+#[path = "auth_cache.rs"]
+pub mod auth_cache;
+pub use auth_cache::AuthKeyCache;
+use auth_cache::ValidationSummary;
+
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
@@ -54,7 +58,7 @@ pub struct AppContext {
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
-    pub api_key_cache: Arc<RwLock<HashMap<String, bool>>>,
+    pub api_key_cache: Arc<RwLock<AuthKeyCache>>,
     pub api_key_validation_urls: Arc<Vec<String>>,
 }
 
@@ -88,7 +92,7 @@ impl AppContext {
             policy_registry,
             router_manager,
             response_storage,
-            api_key_cache: Arc::new(RwLock::new(HashMap::new())),
+            api_key_cache: Arc::new(RwLock::new(AuthKeyCache::default())),
             api_key_validation_urls: Arc::new(api_key_validation_urls),
         })
     }
@@ -425,14 +429,16 @@ async fn authorize_request(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response())?;
 
-    if let Some(valid) = state.context.api_key_cache.read().await.get(token).copied() {
+    // Lookup also reclaims expired results. Never hold the lock during I/O.
+    let cached = state.context.api_key_cache.write().await.get(token);
+    if let Some(valid) = cached {
         if valid {
             return Ok(());
         }
         return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
     }
 
-    let mut validated = false;
+    let mut validation = ValidationSummary::default();
     for url in validation_urls {
         match state
             .context
@@ -442,27 +448,31 @@ async fn authorize_request(
             .send()
             .await
         {
-            Ok(response) if response.status() == StatusCode::OK => {
-                validated = true;
-                break;
+            Ok(response) => {
+                validation.record_status(response.status().as_u16());
+                if validation.is_valid() {
+                    break;
+                }
             }
-            Ok(_) => {
-                continue;
-            }
-            Err(err) => {
-                warn!("Failed to validate API key against {url}: {err}");
+            Err(_) => {
+                validation.record_transport_error();
+                // Do not log credentials, URLs or error payloads.
+                warn!("API key validation request failed; result will not be negative-cached");
             }
         }
     }
 
-    state
-        .context
-        .api_key_cache
-        .write()
-        .await
-        .insert(token.to_string(), validated);
+    if let Some(valid) = validation.cache_value() {
+        // A skipped insert (e.g. oversized key) does not change authorization.
+        state
+            .context
+            .api_key_cache
+            .write()
+            .await
+            .insert(token, valid);
+    }
 
-    if validated {
+    if validation.is_valid() {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response())

@@ -36,6 +36,11 @@ struct State {
     // Shared across P workers because their Mooncake Store is shared.
     prefixes: LruCache<[u8; 32], Instant>,
 }
+impl State {
+    fn expire_live_kv(&mut self, now: Instant) {
+        self.live_kv.retain(|_, row| now.saturating_duration_since(row.observed) < Duration::from_secs(5));
+    }
+}
 #[derive(Debug)]
 pub(super) struct TokenBalancer {
     config: Config,
@@ -171,6 +176,7 @@ impl TokenBalancer {
                     }
                 })).await;
                 let mut state=owner.state.lock();
+                state.expire_live_kv(Instant::now());
                 for rows in results.into_iter().flatten() {
                     for (url,row) in rows {
                         metrics::gauge!("vllm_router_pd_live_kv_usage", "worker"=>url.clone()).set(row.usage);
@@ -220,6 +226,7 @@ impl TokenBalancer {
         -> Option<(usize, usize, Reservation, Reservation)> {
         let mut s = self.state.lock();
         let now = Instant::now();
+        s.expire_live_kv(now);
         let matched = e.pages.iter().take_while(|h| s.prefixes.peek(*h).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(60))).count();
         let c = (matched.saturating_sub(1) * 256).min(e.tokens.saturating_sub(1)) as f64;
         let q = (e.tokens as f64 - c).max(1.0);
@@ -261,6 +268,17 @@ impl TokenBalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn expired_kv_rows_are_reclaimed_not_just_ignored() {
+        let now = Instant::now();
+        let mut state = State { live_kv: HashMap::new(), demand: HashMap::new(),
+            prefixes: LruCache::new(NonZeroUsize::new(20).unwrap()) };
+        state.live_kv.insert("old".into(), LiveKv { usage: 0.5, observed: now - Duration::from_secs(6) });
+        state.live_kv.insert("boundary".into(), LiveKv { usage: 0.5, observed: now - Duration::from_secs(5) });
+        state.live_kv.insert("current".into(), LiveKv { usage: 0.5, observed: now });
+        state.expire_live_kv(now);
+        assert_eq!(state.live_kv.len(), 1);
+        assert!(state.live_kv.contains_key("current"));
+    }
     fn fixture() -> (Arc<TokenBalancer>, Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>) {
         use crate::core::{BasicWorker,WorkerType};
         let ps:Vec<Arc<dyn Worker>>=vec![Arc::new(BasicWorker::new("http://p:1".into(),WorkerType::Regular))];

@@ -175,7 +175,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 120)]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
+    /// Maximum retained Unicode characters per worker in the cache-aware tree
     #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
 
