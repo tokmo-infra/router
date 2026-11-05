@@ -67,6 +67,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 dotenvy = "0.15"
 tokenizers = { version = "0.22.2" }
+tokenizers-pd-fast = { package = "tokenizers", version = "=1.0.0-rc.3", default-features = false, features = ["bpe", "normalizers", "regex"] }
 tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0" }
 rustls = { version = "0.23", default-features = false, features = [

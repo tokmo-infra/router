@@ -131,3 +131,9 @@ for mode in default on off; do
     --output "/tmp/pd-prompt-ids-${mode}.json"
 done
 ```
+
+### PD 分词估算加速（可选）
+
+`VLLM_ROUTER_PD_FAST_TOKENIZER=1` 仅将 TokenBalancer 估算编码换为固定 tokenizers 1.0.0-rc.3；默认0保留旧路径。旧 tokenizer 经官方 canonicalize 转换，仅在内存中用于估算，当前限定已验收的 DS 空 normalizer/BPE。BPE cache 容量仍沿用原配置（本组0），12槽/16核/64GiB不变。
+
+先核 token IDs、256-token页哈希和输出预算一致，再做完整估算CPU对照及真实PD联调。模型 tokenizer、请求体、P/D采样、异步调度、Graph、KV/RDMA及Mooncake生命周期不改；CPU收益不代表模型吞吐或SLO。回滚移除此环境变量或恢复旧Router镜像。
