@@ -1,5 +1,8 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
+#[path = "pd_request_trace.rs"]
+mod pd_request_trace;
+use pd_request_trace::RequestTrace;
 use super::dp_utils;
 use super::pd_timeout::{PdBudget, PdTimeouts};
 use super::token_balance::{TokenBalancer, Reservation as TokenReservation};
@@ -1454,11 +1457,17 @@ impl VllmPDRouter {
         &self, original_request: Value, prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>, path: &str, headers: Option<&HeaderMap>,
         prefill_token_reservation: Option<TokenReservation>, budget: PdBudget,
+        mut request_trace: RequestTrace,
     ) -> Result<Response, PDRouterError> {
-        budget.until_total(self.process_vllm_two_stage_request_inner(
+        let result = budget.until_total(self.process_vllm_two_stage_request_inner(
             original_request, prefill_worker, decode_worker, path, headers,
-            prefill_token_reservation, budget,
-        )).await.map_err(|e| PDRouterError::NetworkError { message: e.to_string() })?
+            prefill_token_reservation, budget, &request_trace,
+        )).await.map_err(|e| PDRouterError::NetworkError { message: e.to_string() });
+        match result {
+            Ok(Ok(response)) => Ok(request_trace.response(response)),
+            Ok(Err(error)) => { request_trace.finish("error"); Err(error) }
+            Err(error) => { request_trace.finish("timeout"); Err(error) }
+        }
     }
 
     async fn process_vllm_two_stage_request_inner(
@@ -1470,6 +1479,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         prefill_token_reservation: Option<TokenReservation>,
         budget: PdBudget,
+        request_trace: &RequestTrace,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1478,6 +1488,8 @@ impl VllmPDRouter {
             .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
             .await
         {
+            request_trace.bridge(&request_id, None);
+            request_trace.stage("concurrent_path_not_phase_traced");
             return self
                 .process_concurrent_two_stage(
                     prefill_request,
@@ -1521,6 +1533,7 @@ impl VllmPDRouter {
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
+        request_trace.bridge(&request_id, transfer_id.as_deref());
 
         // Add kv_transfer_params for KV connector support at top level
         let decode_base_url = decode_worker.base_url().to_string();
@@ -1580,6 +1593,8 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
+        // Dispatch entry BEFORE .json serialization, not proof bytes are on the wire.
+        request_trace.stage("p_dispatch");
         let prefill_response = match budget.send(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -1605,6 +1620,7 @@ impl VllmPDRouter {
             }
         };
 
+        request_trace.stage("p_headers");
         debug!("📥 Prefill response status: {}", prefill_response.status());
         debug!(
             "📥 Prefill response headers: {:?}",
@@ -1630,6 +1646,7 @@ impl VllmPDRouter {
             }
         };
 
+        request_trace.stage("p_body_done");
         debug!(
             "📥 Prefill response body size: {} bytes",
             prefill_bytes.len()
@@ -1750,6 +1767,8 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
+        // Dispatch entry BEFORE .json serialization, not proof bytes are on the wire.
+        request_trace.stage("d_dispatch");
         let decode_response = match budget.send(
             decode_request_builder.json(&decode_request),
             headers,
@@ -1776,6 +1795,7 @@ impl VllmPDRouter {
             }
         };
 
+        request_trace.stage("d_headers");
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
@@ -1813,10 +1833,11 @@ impl VllmPDRouter {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
             // Read decode response body
-            let decode_body =
-                decode_response
-                    .bytes()
-                    .await
+            let decode_body = if request_trace.enabled() {
+                request_trace.collect_body(decode_response.bytes_stream()).await
+            } else {
+                decode_response.bytes().await
+            }
                     .map_err(|e| PDRouterError::NetworkError {
                         message: format!(
                             "Failed to read decode response from {}: {}",
@@ -1871,7 +1892,11 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
+            let body = if request_trace.enabled() {
+                Body::from_stream(request_trace.observe_stream(decode_response.bytes_stream()))
+            } else {
+                Body::from_stream(decode_response.bytes_stream())
+            };
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -2367,6 +2392,7 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        let request_trace = RequestTrace::new(headers, !self.use_discovery);
         info!(
             "vLLM route_chat called, use_discovery={}",
             self.use_discovery
@@ -2459,6 +2485,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
+            request_trace.stage("selection_start");
             let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation, budget) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
                     request_str, request_headers.as_ref()).await {
@@ -2468,6 +2495,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            request_trace.selected(prefill_worker.base_url(), prefill_worker.dp_rank(), decode_worker.base_url(), decode_worker.dp_rank());
             let buffered_response = is_buffered_logprobs_response(&request_json);
             // Decode reservation covers selection, both stages, and the response body.
 
@@ -2489,6 +2517,7 @@ impl RouterTrait for VllmPDRouter {
                     headers,
                     prefill_token_reservation,
                     budget,
+                    request_trace,
                 )
                 .await
             {
@@ -2515,6 +2544,7 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        let request_trace = RequestTrace::new(headers, !self.use_discovery);
         info!(
             "vLLM route_completion called, use_discovery={}",
             self.use_discovery
@@ -2607,6 +2637,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
+            request_trace.stage("selection_start");
             let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation, budget) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
                     request_str, request_headers.as_ref()).await {
@@ -2616,6 +2647,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            request_trace.selected(prefill_worker.base_url(), prefill_worker.dp_rank(), decode_worker.base_url(), decode_worker.dp_rank());
             let buffered_response = is_buffered_logprobs_response(&request_json);
             // Decode reservation covers selection, both stages, and the response body.
 
@@ -2637,6 +2669,7 @@ impl RouterTrait for VllmPDRouter {
                     headers,
                     prefill_token_reservation,
                     budget,
+                    request_trace,
                 )
                 .await
             {
@@ -2741,6 +2774,7 @@ impl RouterTrait for VllmPDRouter {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        let request_trace = RequestTrace::new(headers, !self.use_discovery);
         // Only handle POST requests for inference
         if *method != Method::POST {
             return (
@@ -2806,6 +2840,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
+            request_trace.stage("selection_start");
             let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation, budget) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
                     request_str, request_headers.as_ref()).await {
@@ -2815,6 +2850,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            request_trace.selected(prefill_worker.base_url(), prefill_worker.dp_rank(), decode_worker.base_url(), decode_worker.dp_rank());
             let buffered_response = is_buffered_logprobs_response(&request_json);
 
             debug!(
@@ -2833,6 +2869,7 @@ impl RouterTrait for VllmPDRouter {
                     headers,
                     prefill_token_reservation,
                     budget,
+                    request_trace,
                 )
                 .await
             {
