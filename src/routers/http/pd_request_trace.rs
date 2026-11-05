@@ -246,7 +246,9 @@ mod tests {
     #[test]
     fn disabled_is_silent_and_ids_bridge_without_secrets() {
         let (logs, _guard) = capture();
-        drop(RequestTrace::with_enabled(None, false));
+        let disabled = RequestTrace::with_enabled(None, false);
+        disabled.stage("d_json_ready");
+        drop(disabled);
         assert!(!RequestTrace::new(None, false).enabled());
         assert!(text(&logs).is_empty());
         let mut headers = HeaderMap::new();
@@ -264,6 +266,7 @@ mod tests {
         trace.stage("p_headers");
         trace.stage("p_body_done");
         trace.stage("d_dispatch");
+        trace.stage("d_json_ready");
         trace.stage("d_headers");
         trace.finish("error");
         drop(trace);
@@ -304,6 +307,7 @@ mod tests {
             "p_headers",
             "p_body_done",
             "d_dispatch",
+            "d_json_ready",
             "d_headers",
             "end",
         ] {

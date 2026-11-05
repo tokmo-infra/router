@@ -1769,8 +1769,10 @@ impl VllmPDRouter {
 
         // Dispatch entry BEFORE .json serialization, not proof bytes are on the wire.
         request_trace.stage("d_dispatch");
+        let decode_request_builder = decode_request_builder.json(&decode_request);
+        request_trace.stage("d_json_ready");
         let decode_response = match budget.send(
-            decode_request_builder.json(&decode_request),
+            decode_request_builder,
             headers,
             ClientRequestOptions {
                 method: "POST",
