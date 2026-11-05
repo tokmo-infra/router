@@ -491,6 +491,64 @@ impl ConcurrencyLimiter {
 }
 
 /// Middleware function for concurrency limiting with optional queuing
+struct AdmissionWait {
+    start: Instant,
+    finished: bool,
+}
+impl AdmissionWait {
+    fn finish(&mut self, outcome: &'static str) {
+        if !self.finished {
+            metrics::histogram!("vllm_router_frontend_admission_wait_seconds", "outcome" => outcome)
+                .record(self.start.elapsed().as_secs_f64());
+            self.finished = true;
+        }
+    }
+}
+impl Drop for AdmissionWait {
+    fn drop(&mut self) {
+        self.finish("cancelled");
+    }
+}
+
+#[cfg(test)]
+mod admission_wait_tests {
+    use super::*;
+    #[test]
+    fn queue_wait_is_observed_once_on_admission_or_cancellation() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut wait = AdmissionWait {
+                start: Instant::now(),
+                finished: false,
+            };
+            wait.finish("admitted");
+            wait.finish("error");
+            drop(wait);
+            drop(AdmissionWait {
+                start: Instant::now(),
+                finished: false,
+            });
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| line
+                .starts_with("vllm_router_frontend_admission_wait_seconds_count{")
+                && line.contains("admitted")
+                && line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line
+                .starts_with("vllm_router_frontend_admission_wait_seconds_count{")
+                && line.contains("cancelled")
+                && line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("outcome=\"error\""));
+    }
+}
+
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
     request: Request<axum::body::Body>,
@@ -498,6 +556,10 @@ pub async fn concurrency_limit_middleware(
 ) -> Response {
     // Static counter for embeddings queue size
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
+    let mut admission_wait = AdmissionWait {
+        start: Instant::now(),
+        finished: false,
+    };
 
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
@@ -505,6 +567,7 @@ pub async fn concurrency_limit_middleware(
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
+        admission_wait.finish("admitted");
         debug!("Acquired token immediately");
         let response = next.run(request).await;
 
@@ -535,7 +598,13 @@ pub async fn concurrency_limit_middleware(
                     }
 
                     // Wait for token from queue processor
-                    match permit_rx.await {
+                    let permit_result = permit_rx.await;
+                    admission_wait.finish(match &permit_result {
+                        Ok(Ok(())) => "admitted",
+                        Ok(Err(_)) => "rejected",
+                        Err(_) => "error",
+                    });
+                    match permit_result {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
                             // Dequeue for embeddings
@@ -575,11 +644,13 @@ pub async fn concurrency_limit_middleware(
                     }
                 }
                 Err(_) => {
+                    admission_wait.finish("rejected");
                     warn!("Request queue is full, returning 429");
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
+            admission_wait.finish("rejected");
             warn!("No tokens available and queuing is disabled, returning 429");
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
