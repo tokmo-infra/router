@@ -302,6 +302,7 @@ async fn route_request(router: &VllmPDRouter, request: Value, path: &str) -> Res
             None,
             pr,
             budget,
+            RequestTrace::new(None, false),
         )
         .await
         .map(|response| finish_reserved_response(response, reservation, buffered))
