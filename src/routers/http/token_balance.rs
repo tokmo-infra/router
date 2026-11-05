@@ -12,13 +12,27 @@ use tokenizers_pd_fast::pipeline::{EncodeOptions, PipelineModel, PipelineToken, 
 
 // Opt-in only for the PD estimator. The request body, model tokenizer and all
 // other Router tokenizer users remain on their existing path.
+mod compatibility { include!("pd_tokenizer_compat.rs"); }
 struct FastPdTokenizer(PipelineTokenizer);
+fn estimation_content(request: &Value) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "tools": request.get("tools"), "messages": request.get("messages"),
+        "prompt": request.get("prompt"), "cache_salt": request.get("cache_salt"),
+        "model": request.get("model"), "chat_template_kwargs": request.get("chat_template_kwargs")
+    })).map_err(|e| e.to_string())
+}
 impl std::fmt::Debug for FastPdTokenizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("FastPdTokenizer(tokenizers-1.0.0-rc.3)")
     }
 }
 impl FastPdTokenizer {
+    fn compatible_text(text: &str) -> bool {
+        // Exact pinned rc3 vs legacy-Onig classifier delta (upstream #2558).
+        // Ordinary non-ASCII stays fast; changed characters use legacy.
+        compatibility::compatible(text)
+    }
+
     fn load(path: &str, capacity: usize) -> Result<Self, String> {
         let canonical = tokenizers_pd_fast::canonicalize_file(path).map_err(|e| e.to_string())?;
         let loaded = tokenizers_pd_fast::from_json(&canonical).map_err(|e| e.to_string())?;
@@ -319,14 +333,17 @@ impl TokenBalancer {
     pub(super) fn estimate(&self, request: &Value) -> Result<Estimate, String> {
         // Keep tools ahead of messages, independent of temperature/stream/max_tokens.
         // No inference is sent, and no benchmark reference token counts are consumed.
-        let content = serde_json::to_string(&serde_json::json!({
-            "tools": request.get("tools"), "messages": request.get("messages"),
-            "prompt": request.get("prompt"), "cache_salt": request.get("cache_salt"),
-            "model": request.get("model"), "chat_template_kwargs": request.get("chat_template_kwargs")
-        })).map_err(|e| e.to_string())?;
+        let content = estimation_content(request)?;
         let ids = match &self.fast_tokenizer {
-            Some(fast) => fast.ids(&content)?,
-            None => self.tokenizer.encode(content, false).map_err(|e| e.to_string())?.get_ids().to_vec(),
+            Some(fast) if FastPdTokenizer::compatible_text(&content) => {
+                metrics::counter!("vllm_router_pd_tokenizer_requests_total", "backend" => "fast_compatible").increment(1);
+                fast.ids(&content)?
+            },
+            _ => {
+                let backend = if self.fast_tokenizer.is_some() { "legacy_classifier_delta" } else { "legacy_default" };
+                metrics::counter!("vllm_router_pd_tokenizer_requests_total", "backend" => backend).increment(1);
+                self.tokenizer.encode(content, false).map_err(|e| e.to_string())?.get_ids().to_vec()
+            },
         };
         let mut hash = Sha256::new();
         hash.update(serde_json::to_vec(&serde_json::json!([request.get("model"),request.get("cache_salt"),request.get("chat_template_kwargs")])).map_err(|e|e.to_string())?);
@@ -400,6 +417,17 @@ impl TokenBalancer {
 mod tests {
     use super::*;
     #[test]
+    fn fast_pd_guard_preserves_legacy_unicode_dispatch() {
+        for text in ["", "English code\n0123\t", "\0\r\n", "中文", "é", "e\u{301}", "<｜begin▁of▁sentence｜>"] {
+            assert!(FastPdTokenizer::compatible_text(text));
+        }
+        for text in [" \u{1faea}", "x\u{88f}y"] {
+            assert!(!FastPdTokenizer::compatible_text(text));
+            let request = serde_json::json!({"model":"test", "prompt":text});
+            assert!(!FastPdTokenizer::compatible_text(&estimation_content(&request).unwrap()));
+        }
+    }
+    #[test]
     #[ignore = "real SWE CPU-only legacy/fast estimator parity and ABBA; explicit corpus required"]
     fn pd_fast_estimator_swe_abba() {
         let path = std::env::var("ROUTER_BENCH_TOKENIZER").unwrap();
@@ -416,6 +444,14 @@ mod tests {
             owner
         };
         let reference = make(false);
+        let guarded = make(true);
+        for prompt in [" \u{1faea}", "x\u{88f}y", "中文 e\u{301} 🙂", "<｜begin▁of▁sentence｜>"] {
+            let request = serde_json::json!({"model":"test", "prompt":prompt, "max_tokens":17});
+            let expected = reference.estimate(&request).unwrap();
+            let actual = guarded.estimate(&request).unwrap();
+            assert_eq!((actual.tokens,actual.pages,actual.output), (expected.tokens,expected.pages,expected.output));
+        }
+        let compatible_requests = requests.iter().filter(|r| FastPdTokenizer::compatible_text(&estimation_content(r).unwrap())).count();
         let expected: Vec<_> = requests.iter().map(|r| {
             let e = reference.estimate(r).unwrap(); (e.tokens, e.pages, e.output)
         }).collect();
@@ -437,6 +473,7 @@ mod tests {
             let seconds = start.elapsed().as_secs_f64();
             println!("{}", serde_json::json!({"fast":fast,"requests":requests.len(),"seconds":seconds,
                 "requests_per_second":requests.len() as f64/seconds,"slots":12,"bpe_cache_capacity":0,
+                "fast_eligible_requests":compatible_requests,"legacy_fallback_requests":requests.len()-compatible_requests,
                 "input_token_mean":expected.iter().map(|e|e.0).sum::<usize>() as f64/requests.len() as f64,
                 "exact_tokens_pages_output":true,"inference_requests":0}));
         }
