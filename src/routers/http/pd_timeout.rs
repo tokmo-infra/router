@@ -54,12 +54,28 @@ impl PdTimeouts {
     }
 
     pub fn client(self) -> Result<reqwest::Client, String> {
+        let max_idle = Self::pool_limit(|name| std::env::var(name).ok())?;
+        self.client_with_pool_limit(max_idle)
+    }
+
+    fn pool_limit(get: impl Fn(&str) -> Option<String>) -> Result<usize, String> {
+        match get("VLLM_ROUTER_PD_DISABLE_HTTP_POOL").as_deref() {
+            None | Some("0") => Ok(500),
+            Some("1") => Ok(0),
+            _ => Err("VLLM_ROUTER_PD_DISABLE_HTTP_POOL must be 0 or 1".into()),
+        }
+    }
+
+    fn client_with_pool_limit(self, max_idle: usize) -> Result<reqwest::Client, String> {
+        // Opt-in isolation of HTTP/1 busy-connection reuse during long SSE.
+        // Zero disables this PD client's pool; this is not Connection: close
+        // on shared clients and does not change tokenizer/KV caches or retries.
         reqwest::Client::builder()
             .connect_timeout(self.connect)
             .timeout(self.total)
             .retry(reqwest::retry::never())
             .pool_idle_timeout(Duration::from_secs(50))
-            .pool_max_idle_per_host(500)
+            .pool_max_idle_per_host(max_idle)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(30))
             .build()
@@ -316,6 +332,193 @@ impl Stream for PdBodyStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disabling_pd_pool_is_explicit_and_defaults_are_unchanged() {
+        assert_eq!(PdTimeouts::pool_limit(|_| None).unwrap(), 500);
+        assert_eq!(PdTimeouts::pool_limit(|_| Some("0".into())).unwrap(), 500);
+        assert_eq!(PdTimeouts::pool_limit(|_| Some("1".into())).unwrap(), 0);
+        assert!(PdTimeouts::pool_limit(|_| Some("true".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_pd_pool_does_not_wait_for_another_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::oneshot;
+
+        async fn read_head(socket: &mut TcpStream) {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+                assert!(head.len() < 16_384);
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (release, released) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut a, _) = listener.accept().await.unwrap();
+            read_head(&mut a).await;
+            a.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .await
+                .unwrap();
+            let (mut b, _) = listener.accept().await.unwrap();
+            read_head(&mut b).await;
+            b.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            released.await.unwrap();
+            a.write_all(b"done").await.unwrap();
+        });
+        let client = PdTimeouts::parse(30, |_| None)
+            .unwrap()
+            .client_with_pool_limit(0)
+            .unwrap();
+        let first = client.get(&url).send().await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(3), client.get(&url).send())
+            .await
+            .expect("second request waited for the first response body")
+            .unwrap();
+        assert_eq!(second.status(), reqwest::StatusCode::OK);
+        release.send(()).unwrap();
+        assert_eq!(first.text().await.unwrap(), "done");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_pd_pool_post_sse_uses_new_connections_after_eof_and_cancel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::oneshot;
+
+        const FIRST: &[u8] = b"data: {\"delta\":{\"content\":\"held\"}}\n\n";
+        const COMPLETE: &[u8] = b"data: {\"delta\":{\"content\":\"raw\"}}\n\ndata: [DONE]\n\n";
+        async fn read_post(socket: &mut TcpStream, id: &str) {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+                assert!(head.len() < 16_384);
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+            let headers = head.to_ascii_lowercase();
+            assert!(!headers.lines().any(|line| line == "connection: close"));
+            assert!(headers
+                .lines()
+                .any(|line| line == "content-type: application/json"));
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(length < 1024);
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"id": id, "stream": true})
+            );
+        }
+        async fn sse(socket: &mut TcpStream, body: &[u8], eof: bool) {
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            socket
+                .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(body).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            if eof {
+                socket.write_all(b"0\r\n\r\n").await.unwrap();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (cancelled, cancellation_seen) = oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            let (mut a, peer_a) = listener.accept().await.unwrap();
+            read_post(&mut a, "A").await;
+            sse(&mut a, FIRST, false).await;
+            let mut peers = vec![peer_a];
+            let mut posts = vec!["A"];
+            // Keep completed B/C sockets open: a pooling client must not pass
+            // merely because this fixture closed the old connections for it.
+            let mut completed = Vec::new();
+            for id in ["B", "C"] {
+                let (mut socket, peer) = listener.accept().await.unwrap();
+                read_post(&mut socket, id).await;
+                peers.push(peer);
+                posts.push(id);
+                sse(&mut socket, COMPLETE, true).await;
+                completed.push(socket);
+            }
+            let mut byte = [0];
+            assert_eq!(a.read(&mut byte).await.unwrap(), 0, "A must be cancelled");
+            cancelled.send(()).unwrap();
+            let (mut d, peer_d) = listener.accept().await.unwrap();
+            read_post(&mut d, "D").await;
+            peers.push(peer_d);
+            posts.push("D");
+            sse(&mut d, COMPLETE, true).await;
+            (posts, peers)
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(8), async {
+            let client = PdTimeouts::parse(30, |_| None)
+                .unwrap()
+                .client_with_pool_limit(0)
+                .unwrap();
+            let post = |id: &str| {
+                client
+                    .post(&url)
+                    .json(&serde_json::json!({"id": id, "stream": true}))
+            };
+            let response_a = post("A").send().await.unwrap();
+            assert_eq!(response_a.status(), reqwest::StatusCode::OK);
+            let mut a = response_a.bytes_stream();
+            let mut prefix = Vec::new();
+            while prefix.len() < FIRST.len() {
+                prefix.extend_from_slice(&a.next().await.unwrap().unwrap());
+            }
+            assert_eq!(prefix, FIRST);
+            for id in ["B", "C"] {
+                let response = post(id).send().await.unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                assert_eq!(response.bytes().await.unwrap().as_ref(), COMPLETE);
+            }
+            // A has never reached EOF; drop is cancellation, not a body drain.
+            drop(a);
+            cancellation_seen.await.unwrap();
+            let response_d = post("D").send().await.unwrap();
+            assert_eq!(response_d.status(), reqwest::StatusCode::OK);
+            assert_eq!(response_d.bytes().await.unwrap().as_ref(), COMPLETE);
+            let (posts, peers) = (&mut server).await.unwrap();
+            assert_eq!(
+                posts,
+                ["A", "B", "C", "D"],
+                "one wire POST per logical request"
+            );
+            assert_eq!(
+                peers.iter().collect::<std::collections::HashSet<_>>().len(),
+                4
+            );
+        })
+        .await;
+        // Abort the owned listener on deadline; no detached fixture can hang CI.
+        if outcome.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        outcome.expect("pool0 POST/SSE fixture exceeded its total 8s deadline");
+    }
+
     #[test]
     fn stage_observations_finish_and_cancel_without_leaking_waiters() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
