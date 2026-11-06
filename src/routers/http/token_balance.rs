@@ -8,58 +8,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, HashSet}, num::NonZeroUsize, sync::Arc, time::{Duration, Instant}};
 use tokenizers::Tokenizer;
-use tokenizers_pd_fast::pipeline::{EncodeOptions, PipelineModel, PipelineToken, PipelineTokenizer};
-
-// Opt-in only for the PD estimator. The request body, model tokenizer and all
-// other Router tokenizer users remain on their existing path.
-mod compatibility { include!("pd_tokenizer_compat.rs"); }
-struct FastPdTokenizer(PipelineTokenizer);
-fn estimation_content(request: &Value) -> Result<String, String> {
-    serde_json::to_string(&serde_json::json!({
-        "tools": request.get("tools"), "messages": request.get("messages"),
-        "prompt": request.get("prompt"), "cache_salt": request.get("cache_salt"),
-        "model": request.get("model"), "chat_template_kwargs": request.get("chat_template_kwargs")
-    })).map_err(|e| e.to_string())
-}
-impl std::fmt::Debug for FastPdTokenizer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FastPdTokenizer(tokenizers-1.0.0-rc.3)")
-    }
-}
-impl FastPdTokenizer {
-    fn compatible_text(text: &str) -> bool {
-        // Exact pinned rc3 vs legacy-Onig classifier delta (upstream #2558).
-        // Ordinary non-ASCII stays fast; changed characters use legacy.
-        compatibility::compatible(text)
-    }
-
-    fn load(path: &str, capacity: usize) -> Result<Self, String> {
-        let canonical = tokenizers_pd_fast::canonicalize_file(path).map_err(|e| e.to_string())?;
-        let loaded = tokenizers_pd_fast::from_json(&canonical).map_err(|e| e.to_string())?;
-        if !loaded.get_normalizers().is_empty() {
-            return Err("fast PD estimator currently requires the audited empty DS normalizer chain".into());
-        }
-        let PipelineModel::BPE(model) = loaded.get_model();
-        let mut config = model.to_config().map_err(|e| e.to_string())?;
-        config.cache_capacity = capacity; // Do not silently enable the new 65536-entry default.
-        let model = tokenizers_pd_fast::models::bpe::PipelineBPE::from_config(config)
-            .map_err(|e| e.to_string())?;
-        let value: Value = serde_json::from_str(&canonical).map_err(|e| e.to_string())?;
-        let post = tokenizers_pd_fast::post_processor_from_json(
-            &serde_json::to_string(&value["post_processor"]).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        Ok(Self(PipelineTokenizer::from_parts(
-            loaded.get_added_vocabulary().clone(), Vec::new(),
-            loaded.get_pre_tokenizer().clone(), PipelineModel::BPE(model), post,
-            loaded.get_decoder().cloned(), loaded.get_role_to_token().clone(),
-            loaded.get_padding().cloned(), loaded.get_truncation().cloned())))
-    }
-    fn ids(&self, text: &str) -> Result<Vec<u32>, String> {
-        let rows = self.0.encode(text, &EncodeOptions::no_specials()).wait().map_err(|e| e.to_string())?;
-        if rows.len() != 1 { return Err("fast PD estimator expected one untruncated encoding".into()); }
-        Ok(PipelineToken::cast_slice(rows[0].ids()).to_vec())
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct Capacity {
@@ -76,45 +24,6 @@ struct Config {
     prefill_kv_guard: bool,
 }
 fn default_headroom() -> f64 { 0.85 }
-const TOKENIZATION_CONCURRENCY_ENV: &str = "VLLM_ROUTER_PD_TOKENIZATION_CONCURRENCY";
-const BPE_CACHE_CAPACITY_ENV: &str = "VLLM_ROUTER_PD_BPE_CACHE_CAPACITY";
-const MAX_TOKENIZATION_CONCURRENCY: usize = 32;
-const MAX_BPE_CACHE_CAPACITY: usize = 16_384;
-
-fn bounded_setting(name: &str, value: Option<&str>, default: usize, min: usize, max: usize) -> Result<usize, String> {
-    match value {
-        None => Ok(default),
-        Some(raw) => {
-            let parsed = raw.parse::<usize>().map_err(|_| format!("{name} must be an integer in {min}..={max}"))?;
-            if !(min..=max).contains(&parsed) { return Err(format!("{name} must be in {min}..={max}")); }
-            Ok(parsed)
-        }
-    }
-}
-fn env_setting(name: &str) -> Result<Option<String>, String> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(e) => Err(format!("invalid {name}: {e}")),
-    }
-}
-fn tokenization_concurrency(cpus: usize, override_value: Option<&str>) -> Result<usize, String> {
-    let max = cpus.max(1).min(MAX_TOKENIZATION_CONCURRENCY);
-    let default = if cpus > 4 { (cpus - 4).min(max) } else { max };
-    bounded_setting(TOKENIZATION_CONCURRENCY_ENV, override_value, default, 1, max)
-}
-fn bpe_cache_capacity(override_value: Option<&str>) -> Result<usize, String> {
-    // Leave the proven configuration unchanged until workload-specific CPU tests justify enabling it.
-    bounded_setting(BPE_CACHE_CAPACITY_ENV, override_value, 0, 0, MAX_BPE_CACHE_CAPACITY)
-}
-fn set_bpe_cache_capacity(tokenizer: &mut Tokenizer, capacity: usize) {
-    // Tokenizers 0.22.2 deserializes a BPE with a shared, bounded cache. Entries
-    // are word-level (<256 bytes), not copies of complete prompt prefixes.
-    if let tokenizers::models::ModelWrapper::BPE(mut model) = tokenizer.get_model().clone() {
-        model.resize_cache(capacity);
-        tokenizer.with_model(model);
-    }
-}
 #[derive(Debug, Default)]
 struct Demand { requests: usize, kv: f64, work: f64 }
 #[derive(Debug, Clone, Copy)]
@@ -127,16 +36,10 @@ struct State {
     // Shared across P workers because their Mooncake Store is shared.
     prefixes: LruCache<[u8; 32], Instant>,
 }
-impl State {
-    fn expire_live_kv(&mut self, now: Instant) {
-        self.live_kv.retain(|_, row| now.saturating_duration_since(row.observed) < Duration::from_secs(5));
-    }
-}
 #[derive(Debug)]
 pub(super) struct TokenBalancer {
     config: Config,
     tokenizer: Tokenizer,
-    fast_tokenizer: Option<FastPdTokenizer>,
     pub(super) tokenization_slots: Arc<tokio::sync::Semaphore>,
     state: Mutex<State>,
 }
@@ -156,39 +59,6 @@ impl Drop for EstimationTimer {
         metrics::histogram!("vllm_router_pd_estimation_seconds", "phase" => self.phase)
             .record(self.start.elapsed().as_secs_f64());
     }
-}
-
-// Gauges represent waiters and all permit holders, including blocking-pool queue
-// time. RAII covers errors, panics and cancellation; the active guard moves with
-// the owned semaphore permit into the blocking closure.
-struct OccupancyGuard(&'static str);
-impl OccupancyGuard {
-    fn new(name: &'static str) -> Self {
-        metrics::gauge!(name).increment(1.0);
-        Self(name)
-    }
-}
-impl Drop for OccupancyGuard {
-    fn drop(&mut self) { metrics::gauge!(self.0).decrement(1.0); }
-}
-async fn run_tokenization<T: Send + 'static, F: FnOnce() -> Result<T, String> + Send + 'static>(
-    slots: Arc<tokio::sync::Semaphore>, make_work: impl FnOnce() -> F,
-) -> Result<T, String> {
-    let wait = EstimationTimer::start("slot_wait");
-    let waiting = OccupancyGuard::new("vllm_router_pd_tokenization_waiting");
-    let slot = slots.acquire_owned().await.map_err(|e| e.to_string())?;
-    let active = OccupancyGuard::new("vllm_router_pd_tokenization_active");
-    drop(waiting);
-    drop(wait);
-    let work = make_work();
-    let blocking_wait = EstimationTimer::start("blocking_wait");
-    tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        let _active = active;
-        drop(blocking_wait);
-        let _compute = EstimationTimer::start("compute");
-        work()
-    }).await.map_err(|e| e.to_string())?
 }
 #[derive(Debug)]
 pub(super) struct Reservation {
@@ -266,27 +136,16 @@ impl TokenBalancer {
             || config.workers.values().any(|c| !c.kv_tokens.is_finite() || c.kv_tokens <= 0.0 || !c.max_seqs.is_finite() || c.max_seqs <= 0.0) {
             return Err("invalid PD token-balance capacities".into());
         }
-        // available_parallelism observes platform affinity and, on Linux, cgroup
-        // CPU limits where supported. Fall back conservatively if detection fails.
-        let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-        let concurrency = tokenization_concurrency(cpus, env_setting(TOKENIZATION_CONCURRENCY_ENV)?.as_deref())?;
-        let cache_capacity = bpe_cache_capacity(env_setting(BPE_CACHE_CAPACITY_ENV)?.as_deref())?;
         let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path).map_err(|e| e.to_string())?;
-        set_bpe_cache_capacity(&mut tokenizer, cache_capacity);
-        let fast_tokenizer = match env_setting("VLLM_ROUTER_PD_FAST_TOKENIZER")?.as_deref() {
-            None | Some("0") => None,
-            Some("1") => Some(FastPdTokenizer::load(&config.tokenizer_path, cache_capacity)?),
-            _ => return Err("VLLM_ROUTER_PD_FAST_TOKENIZER must be 0 or 1".into()),
-        };
-        tracing::info!(fast_pd_tokenizer=fast_tokenizer.is_some(), "PD estimator tokenizer selected");
-        tracing::info!(workers=config.workers.len(), kv_fraction=config.kv_fraction, effective_cpus=cpus,
-            tokenization_concurrency=concurrency, bpe_cache_capacity=cache_capacity,
-            "PD token balance enabled (heuristic cost; estimated token demand)");
-        metrics::gauge!("vllm_router_pd_tokenization_capacity").set(concurrency as f64);
-        metrics::gauge!("vllm_router_pd_tokenization_active").set(0.0);
-        metrics::gauge!("vllm_router_pd_tokenization_waiting").set(0.0);
+        // BPE caches are thread-local: unbounded blocking-thread fanout multiplies
+        // long-prompt strings. Routing does not need a second full BPE word cache.
+        if let tokenizers::models::ModelWrapper::BPE(mut model) = tokenizer.get_model().clone() {
+            model.resize_cache(0);
+            tokenizer.with_model(model);
+        }
+        tracing::info!(workers=config.workers.len(), kv_fraction=config.kv_fraction, "PD token balance enabled (heuristic cost; estimated token demand)");
         let enabled=config.prefill_kv_guard;
-        let result=Arc::new(Self { config, tokenizer, fast_tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(concurrency)), state: Mutex::new(State {
+        let result=Arc::new(Self { config, tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(4)), state: Mutex::new(State {
             demand: HashMap::new(), live_kv:HashMap::new(), prefixes: LruCache::new(NonZeroUsize::new(262144).unwrap()),
         }) });
         if enabled { Self::start_kv_watch(&result); }
@@ -312,7 +171,6 @@ impl TokenBalancer {
                     }
                 })).await;
                 let mut state=owner.state.lock();
-                state.expire_live_kv(Instant::now());
                 for rows in results.into_iter().flatten() {
                     for (url,row) in rows {
                         metrics::gauge!("vllm_router_pd_live_kv_usage", "worker"=>url.clone()).set(row.usage);
@@ -324,27 +182,30 @@ impl TokenBalancer {
     }
     pub(super) async fn estimate_async(self: &Arc<Self>, request: &Value) -> Result<Estimate, String> {
         let _total = EstimationTimer::start("total");
-        run_tokenization(self.tokenization_slots.clone(), || {
-            let owner = self.clone();
-            let value = request.clone();
-            move || owner.estimate(&value)
-        }).await
+        let wait = EstimationTimer::start("slot_wait");
+        let slot = self.tokenization_slots.clone().acquire_owned().await.map_err(|e|e.to_string())?;
+        drop(wait);
+        let owner = self.clone();
+        let value = request.clone();
+        let blocking_wait = EstimationTimer::start("blocking_wait");
+        tokio::task::spawn_blocking(move || {
+            drop(blocking_wait);
+            // A cancelled HTTP future must not release a still-running tokenizer's slot.
+            let _slot = slot;
+            let _compute = EstimationTimer::start("compute");
+            owner.estimate(&value)
+        }).await.map_err(|e|e.to_string())?
     }
     pub(super) fn estimate(&self, request: &Value) -> Result<Estimate, String> {
         // Keep tools ahead of messages, independent of temperature/stream/max_tokens.
         // No inference is sent, and no benchmark reference token counts are consumed.
-        let content = estimation_content(request)?;
-        let ids = match &self.fast_tokenizer {
-            Some(fast) if FastPdTokenizer::compatible_text(&content) => {
-                metrics::counter!("vllm_router_pd_tokenizer_requests_total", "backend" => "fast_compatible").increment(1);
-                fast.ids(&content)?
-            },
-            _ => {
-                let backend = if self.fast_tokenizer.is_some() { "legacy_classifier_delta" } else { "legacy_default" };
-                metrics::counter!("vllm_router_pd_tokenizer_requests_total", "backend" => backend).increment(1);
-                self.tokenizer.encode(content, false).map_err(|e| e.to_string())?.get_ids().to_vec()
-            },
-        };
+        let content = serde_json::to_string(&serde_json::json!({
+            "tools": request.get("tools"), "messages": request.get("messages"),
+            "prompt": request.get("prompt"), "cache_salt": request.get("cache_salt"),
+            "model": request.get("model"), "chat_template_kwargs": request.get("chat_template_kwargs")
+        })).map_err(|e| e.to_string())?;
+        let encoded = self.tokenizer.encode(content, false).map_err(|e| e.to_string())?;
+        let ids = encoded.get_ids();
         let mut hash = Sha256::new();
         hash.update(serde_json::to_vec(&serde_json::json!([request.get("model"),request.get("cache_salt"),request.get("chat_template_kwargs")])).map_err(|e|e.to_string())?);
         let mut pages = Vec::with_capacity(ids.len() / 256);
@@ -359,7 +220,6 @@ impl TokenBalancer {
         -> Option<(usize, usize, Reservation, Reservation)> {
         let mut s = self.state.lock();
         let now = Instant::now();
-        s.expire_live_kv(now);
         let matched = e.pages.iter().take_while(|h| s.prefixes.peek(*h).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(60))).count();
         let c = (matched.saturating_sub(1) * 256).min(e.tokens.saturating_sub(1)) as f64;
         let q = (e.tokens as f64 - c).max(1.0);
@@ -397,98 +257,10 @@ impl TokenBalancer {
         let missing: HashSet<_> = workers.iter().filter(|w| !self.config.workers.contains_key(w.base_url())).map(|w|w.base_url()).collect();
         if missing.is_empty() { Ok(()) } else { Err(format!("missing PD capacity config: {:?}", missing)) }
     }
-    #[cfg(test)]
-    pub(super) fn for_test_workers(workers: &[Arc<dyn Worker>]) -> Arc<Self> {
-        Arc::new(Self { config: Config { tokenizer_path: String::new(), kv_fraction: 0.85,
-            prefill_kv_guard: false, workers: workers.iter().map(|w| (w.base_url().to_string(),
-                Capacity { kv_tokens: 2e6, max_seqs: 512.0 })).collect() },
-            tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
-            fast_tokenizer: None,
-            tokenization_slots: Arc::new(tokio::sync::Semaphore::new(4)),
-            state: Mutex::new(State { demand: HashMap::new(), live_kv: HashMap::new(),
-                prefixes: LruCache::new(NonZeroUsize::new(20).unwrap()) }) })
-    }
-    #[cfg(test)]
-    pub(super) fn assigned_for_test(&self, url: &str) -> usize {
-        self.state.lock().demand.get(url).map_or(0, |d| d.requests)
-    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn fast_pd_guard_preserves_legacy_unicode_dispatch() {
-        for text in ["", "English code\n0123\t", "\0\r\n", "中文", "é", "e\u{301}", "<｜begin▁of▁sentence｜>"] {
-            assert!(FastPdTokenizer::compatible_text(text));
-        }
-        for text in [" \u{1faea}", "x\u{88f}y"] {
-            assert!(!FastPdTokenizer::compatible_text(text));
-            let request = serde_json::json!({"model":"test", "prompt":text});
-            assert!(!FastPdTokenizer::compatible_text(&estimation_content(&request).unwrap()));
-        }
-    }
-    #[test]
-    #[ignore = "real SWE CPU-only legacy/fast estimator parity and ABBA; explicit corpus required"]
-    fn pd_fast_estimator_swe_abba() {
-        let path = std::env::var("ROUTER_BENCH_TOKENIZER").unwrap();
-        let requests: Vec<Value> = serde_json::from_slice(
-            &std::fs::read(std::env::var("ROUTER_BENCH_REQUESTS").unwrap()).unwrap()).unwrap();
-        assert_eq!(requests.len(), 24);
-        let make = |fast: bool| {
-            let (mut owner, _, _) = fixture();
-            let b = Arc::get_mut(&mut owner).unwrap();
-            b.tokenizer = Tokenizer::from_file(&path).unwrap();
-            set_bpe_cache_capacity(&mut b.tokenizer, 0);
-            b.fast_tokenizer = fast.then(|| FastPdTokenizer::load(&path, 0).unwrap());
-            b.tokenization_slots = Arc::new(tokio::sync::Semaphore::new(12));
-            owner
-        };
-        let reference = make(false);
-        let guarded = make(true);
-        for prompt in [" \u{1faea}", "x\u{88f}y", "中文 e\u{301} 🙂", "<｜begin▁of▁sentence｜>"] {
-            let request = serde_json::json!({"model":"test", "prompt":prompt, "max_tokens":17});
-            let expected = reference.estimate(&request).unwrap();
-            let actual = guarded.estimate(&request).unwrap();
-            assert_eq!((actual.tokens,actual.pages,actual.output), (expected.tokens,expected.pages,expected.output));
-        }
-        let compatible_requests = requests.iter().filter(|r| FastPdTokenizer::compatible_text(&estimation_content(r).unwrap())).count();
-        let expected: Vec<_> = requests.iter().map(|r| {
-            let e = reference.estimate(r).unwrap(); (e.tokens, e.pages, e.output)
-        }).collect();
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
-        for fast in [false, true, true, false, false, true, true, false] {
-            let owner = make(fast);
-            let start = Instant::now();
-            runtime.block_on(async {
-                let mut joins = Vec::new();
-                for (i, r) in requests.iter().cloned().enumerate() {
-                    let owner = owner.clone();
-                    joins.push(tokio::spawn(async move { (i, owner.estimate_async(&r).await.unwrap()) }));
-                }
-                for join in joins {
-                    let (i, e) = join.await.unwrap();
-                    assert_eq!((e.tokens, e.pages, e.output), expected[i]);
-                }
-            });
-            let seconds = start.elapsed().as_secs_f64();
-            println!("{}", serde_json::json!({"fast":fast,"requests":requests.len(),"seconds":seconds,
-                "requests_per_second":requests.len() as f64/seconds,"slots":12,"bpe_cache_capacity":0,
-                "fast_eligible_requests":compatible_requests,"legacy_fallback_requests":requests.len()-compatible_requests,
-                "input_token_mean":expected.iter().map(|e|e.0).sum::<usize>() as f64/requests.len() as f64,
-                "exact_tokens_pages_output":true,"inference_requests":0}));
-        }
-    }
-    #[test] fn expired_kv_rows_are_reclaimed_not_just_ignored() {
-        let now = Instant::now();
-        let mut state = State { live_kv: HashMap::new(), demand: HashMap::new(),
-            prefixes: LruCache::new(NonZeroUsize::new(20).unwrap()) };
-        state.live_kv.insert("old".into(), LiveKv { usage: 0.5, observed: now - Duration::from_secs(6) });
-        state.live_kv.insert("boundary".into(), LiveKv { usage: 0.5, observed: now - Duration::from_secs(5) });
-        state.live_kv.insert("current".into(), LiveKv { usage: 0.5, observed: now });
-        state.expire_live_kv(now);
-        assert_eq!(state.live_kv.len(), 1);
-        assert!(state.live_kv.contains_key("current"));
-    }
     fn fixture() -> (Arc<TokenBalancer>, Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>) {
         use crate::core::{BasicWorker,WorkerType};
         let ps:Vec<Arc<dyn Worker>>=vec![Arc::new(BasicWorker::new("http://p:1".into(),WorkerType::Regular))];
@@ -497,7 +269,6 @@ mod tests {
             ("http://d:1".into(),Capacity{kv_tokens:2e6,max_seqs:24.0})]);
         let b=Arc::new(TokenBalancer{config:Config{tokenizer_path:String::new(),workers,kv_fraction:0.85,prefill_kv_guard:false},
             tokenizer:Tokenizer::new(tokenizers::models::bpe::BPE::default()),
-            fast_tokenizer: None,
             tokenization_slots:Arc::new(tokio::sync::Semaphore::new(4)),
             state:Mutex::new(State{demand:HashMap::new(),live_kv:HashMap::new(),prefixes:LruCache::new(NonZeroUsize::new(20).unwrap())})});
         (b,ps,ds)
@@ -516,19 +287,17 @@ mod tests {
     }
     #[tokio::test] async fn async_estimation_preserves_tokens_and_releases_slot() {
         let (b,_,_) = fixture();
-        let capacity = b.tokenization_slots.available_permits();
         let request = serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":12});
         let expected = b.estimate(&request).unwrap();
         let actual = b.estimate_async(&request).await.unwrap();
         assert_eq!(actual.tokens, expected.tokens);
         assert_eq!(actual.output, expected.output);
         assert_eq!(actual.pages, expected.pages);
-        assert_eq!(b.tokenization_slots.available_permits(), capacity);
+        assert_eq!(b.tokenization_slots.available_permits(), 4);
     }
     #[tokio::test] async fn cancelled_slot_wait_does_not_consume_a_permit() {
         let (b,_,_) = fixture();
-        let capacity = b.tokenization_slots.available_permits();
-        let all = b.tokenization_slots.clone().acquire_many_owned(capacity as u32).await.unwrap();
+        let all = b.tokenization_slots.clone().acquire_many_owned(4).await.unwrap();
         let owner = b.clone();
         let task = tokio::spawn(async move { owner.estimate_async(&serde_json::json!({})).await });
         tokio::task::yield_now().await;
@@ -536,138 +305,7 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         drop(all);
-        assert_eq!(b.tokenization_slots.available_permits(), capacity);
-    }
-    #[test] fn tokenization_configuration_is_bounded() {
-        assert_eq!(tokenization_concurrency(16, None).unwrap(), 12);
-        assert_eq!(tokenization_concurrency(1, None).unwrap(), 1);
-        assert_eq!(tokenization_concurrency(4, None).unwrap(), 4);
-        assert_eq!(tokenization_concurrency(128, None).unwrap(), MAX_TOKENIZATION_CONCURRENCY);
-        assert_eq!(tokenization_concurrency(16, Some("16")).unwrap(), 16);
-        for invalid in ["0", "17", "-1", "abc", "", "99999999999999999999999999999999"] {
-            assert!(tokenization_concurrency(16, Some(invalid)).is_err(), "{invalid}");
-        }
-        assert_eq!(bpe_cache_capacity(None).unwrap(), 0);
-        assert_eq!(bpe_cache_capacity(Some("1024")).unwrap(), 1024);
-        assert!(bpe_cache_capacity(Some("16385")).is_err());
-        assert!(bpe_cache_capacity(Some("-1")).is_err());
-    }
-    #[test]
-    #[ignore = "CPU-only workload benchmark; requires explicit tokenizer and SWE request corpus"]
-    fn tokenization_workload_abba() {
-        let path = std::env::var("ROUTER_BENCH_TOKENIZER").unwrap();
-        let corpus = std::env::var("ROUTER_BENCH_REQUESTS").unwrap();
-        let requests: Vec<Value> = serde_json::from_slice(&std::fs::read(corpus).unwrap()).unwrap();
-        assert!((12..=128).contains(&requests.len()));
-        let make = |slots, cache| {
-            let (mut b, _, _) = fixture();
-            let inner = Arc::get_mut(&mut b).unwrap();
-            inner.tokenizer = Tokenizer::from_file(&path).unwrap();
-            set_bpe_cache_capacity(&mut inner.tokenizer, cache);
-            inner.tokenization_slots = Arc::new(tokio::sync::Semaphore::new(slots));
-            b
-        };
-        let reference = make(4, 0);
-        let expected: Vec<_> = requests.iter().map(|r| {
-            let e = reference.estimate(r).unwrap(); (e.tokens, e.pages, e.output)
-        }).collect();
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2)
-            .max_blocking_threads(16).enable_all().build().unwrap();
-        // ABC-CBA repeats each admission setting with unchanged requests and CPU affinity.
-        for (slots, cache) in [(4,0),(12,0),(12,4096),(12,4096),(12,0),(4,0)] {
-            let b = make(slots, cache);
-            for request in requests.iter().take(2) { b.estimate(request).unwrap(); }
-            let start = Instant::now();
-            let mut latencies = runtime.block_on(async {
-                let mut pending = tokio::task::JoinSet::new();
-                for (i, request) in requests.iter().cloned().enumerate() {
-                    let owner = b.clone();
-                    pending.spawn(async move {
-                        let t = Instant::now();
-                        let e = owner.estimate_async(&request).await.unwrap();
-                        (i, e, t.elapsed().as_secs_f64())
-                    });
-                }
-                let mut times = Vec::new();
-                while let Some(row) = pending.join_next().await {
-                    let (i,e,t) = row.unwrap();
-                    assert_eq!((e.tokens,e.pages,e.output),expected[i],"token/page identity drift");
-                    times.push(t);
-                }
-                times
-            });
-            let seconds = start.elapsed().as_secs_f64();
-            latencies.sort_by(f64::total_cmp);
-            println!("ROUTER_CPU_BENCH {}", serde_json::json!({
-                "slots":slots,"bpe_cache_capacity":cache,"requests":requests.len(),
-                "seconds":seconds,"requests_per_second":requests.len() as f64/seconds,
-                "batch_latency_p50_s":latencies[latencies.len()/2],
-                "batch_latency_max_s":latencies.last(),
-                "input_token_mean":expected.iter().map(|e|e.0).sum::<usize>() as f64/expected.len() as f64,
-                "exact_tokens_and_pages":true,"inference_requests_sent":0
-            }));
-        }
-    }
-    #[test] fn bpe_cache_keeps_exact_ids_and_page_hashes() {
-        // A real merge and many repeated words exercise both cache paths.
-        let mut vocab = serde_json::Map::new();
-        for byte in 32u8..=126 { vocab.insert((byte as char).to_string(), serde_json::json!(byte)); }
-        vocab.insert("ab".into(), serde_json::json!(127));
-        let model_json = serde_json::json!({
-            "type":"BPE", "vocab":vocab, "merges":[["a","b"]]
-        }).to_string();
-        let model: tokenizers::models::bpe::BPE = serde_json::from_str(&model_json).unwrap();
-        let make_balancer = |capacity| {
-            let (mut owner, _, _) = fixture();
-            let b = Arc::get_mut(&mut owner).unwrap();
-            b.tokenizer = Tokenizer::new(model.clone());
-            b.tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace::default()));
-            set_bpe_cache_capacity(&mut b.tokenizer, capacity);
-            owner
-        };
-        let without = make_balancer(0);
-        let with = make_balancer(1024);
-        let request = serde_json::json!({"model":"test","prompt":"ab ab abc ab cd ".repeat(512),
-            "cache_salt":"salt","max_completion_tokens":17});
-        let content = serde_json::to_string(&serde_json::json!({
-            "tools": request.get("tools"), "messages": request.get("messages"),
-            "prompt": request.get("prompt"), "cache_salt": request.get("cache_salt"),
-            "model": request.get("model"), "chat_template_kwargs": request.get("chat_template_kwargs")
-        })).unwrap();
-        let expected_ids = without.tokenizer.encode(content.clone(), false).unwrap().get_ids().to_vec();
-        assert!(expected_ids.len() >= 256);
-        assert!(expected_ids.contains(&127));
-        for _ in 0..2 {
-            assert_eq!(with.tokenizer.encode(content.clone(), false).unwrap().get_ids(), expected_ids);
-            let expected = without.estimate(&request).unwrap();
-            let actual = with.estimate(&request).unwrap();
-            assert!(!expected.pages.is_empty());
-            assert_eq!(actual.tokens, expected.tokens);
-            assert_eq!(actual.pages, expected.pages);
-            assert_eq!(actual.output, 17);
-        }
-    }
-    #[tokio::test] async fn cancelled_blocking_work_keeps_its_slot_until_finished() {
-        let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let work_slots = slots.clone();
-        let task = tokio::spawn(async move {
-            run_tokenization(work_slots, || move || {
-                let _ = started_tx.send(());
-                let _ = release_rx.recv();
-                Ok(())
-            }).await
-        });
-        tokio::time::timeout(Duration::from_secs(5), started_rx).await.unwrap().unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(slots.available_permits(), 0);
-        assert!(slots.clone().try_acquire_owned().is_err());
-        release_tx.send(()).unwrap();
-        let permit = tokio::time::timeout(Duration::from_secs(5), slots.clone().acquire_owned()).await.unwrap().unwrap();
-        drop(permit);
-        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(b.tokenization_slots.available_permits(), 4);
     }
     #[test] fn cancellation_does_not_publish_cache_and_releases_all_demand() {
         let (b,ps,ds)=fixture();

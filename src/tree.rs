@@ -4,7 +4,7 @@ use std::{
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock, Weak,
+        Arc, RwLock,
     },
 };
 
@@ -235,8 +235,8 @@ struct Node {
     text: RwLock<NodeText>,
     /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
     tenant_last_access_time: DashMap<TenantId, u64>,
-    /// Upward traversal must not keep the parent (and its children) alive.
-    parent: RwLock<Weak<Node>>,
+    /// Parent pointer for upward traversal during timestamp updates
+    parent: RwLock<Option<NodeRef>>,
     /// Cached last-accessed tenant for O(1) lookup during prefix match.
     /// Avoids O(shards) DashMap iteration in the common case.
     last_tenant: parking_lot::RwLock<Option<TenantId>>,
@@ -245,8 +245,6 @@ struct Node {
 #[derive(Debug)]
 pub struct Tree {
     root: NodeRef,
-    // Destructive sweeps run exclusively with inserts and matching traversals.
-    maintenance: RwLock<()>,
     /// Per-tenant character count for size tracking. Using TenantId for consistency.
     pub tenant_char_count: DashMap<TenantId, usize>,
 }
@@ -329,24 +327,6 @@ impl Default for Tree {
     }
 }
 
-impl Drop for Tree {
-    fn drop(&mut self) {
-        // Long multi-turn prefixes can form a deep chain. Detach downward
-        // links iteratively instead of recursively dropping Arc<Node>s.
-        let mut pending: Vec<_> = self
-            .root
-            .children
-            .iter()
-            .map(|child| Arc::clone(child.value()))
-            .collect();
-        self.root.children.clear();
-        while let Some(node) = pending.pop() {
-            pending.extend(node.children.iter().map(|child| Arc::clone(child.value())));
-            node.children.clear();
-        }
-    }
-}
-
 impl Tree {
     /*
     Thread-safe multi tenant radix tree
@@ -372,16 +352,14 @@ impl Tree {
                 ),
                 text: RwLock::new(NodeText::empty()),
                 tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
-                parent: RwLock::new(Weak::new()),
+                parent: RwLock::new(None),
                 last_tenant: parking_lot::RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
-            maintenance: RwLock::new(()),
         }
     }
 
     pub fn insert(&self, text: &str, tenant: &str) {
-        let _maintenance = self.maintenance.read().unwrap();
         // Insert text into tree with given tenant
         // Use slice-based traversal to avoid Vec<char> allocation
 
@@ -427,7 +405,7 @@ impl Tree {
                         children: new_children_map(),
                         text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: new_tenant_map(),
-                        parent: RwLock::new(Arc::downgrade(&prev)),
+                        parent: RwLock::new(Some(Arc::clone(&prev))),
                         last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
@@ -466,7 +444,7 @@ impl Tree {
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
                             children: new_children_map(),
-                            parent: RwLock::new(Arc::downgrade(&prev)),
+                            parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
                             last_tenant: parking_lot::RwLock::new(
                                 matched_node.last_tenant.read().clone(),
@@ -481,7 +459,7 @@ impl Tree {
                         entry.insert(Arc::clone(&new_node));
 
                         *matched_node.text.write().unwrap() = contracted_text;
-                        *matched_node.parent.write().unwrap() = Arc::downgrade(&new_node);
+                        *matched_node.parent.write().unwrap() = Some(Arc::clone(&new_node));
 
                         // Attach tenant to the new split node (intermediate - no timestamp update)
                         // The cloned DashMap already has the tenant; just ensure char count is correct
@@ -551,7 +529,6 @@ impl Tree {
     /// Performs prefix matching and returns detailed result with char counts.
     /// Optimized: no string allocations, deferred char counting.
     pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
-        let _maintenance = self.maintenance.read().unwrap();
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
@@ -651,7 +628,6 @@ impl Tree {
 
     #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
-        let _maintenance = self.maintenance.read().unwrap();
         let (matched_chars, curr, tenant_id) = self.prefix_match_tenant_state(text, tenant);
 
         // Only update timestamp if we found a match for the specified tenant.
@@ -671,7 +647,6 @@ impl Tree {
 
     /// Return one tenant's matched character count without updating LRU state.
     pub fn prefix_match_tenant_char_count(&self, text: &str, tenant: &str) -> usize {
-        let _maintenance = self.maintenance.read().unwrap();
         self.prefix_match_tenant_state(text, tenant).0
     }
 
@@ -733,7 +708,6 @@ impl Tree {
     }
 
     pub fn evict_tenant_by_size(&self, max_size: usize) {
-        let _maintenance = self.maintenance.write().unwrap();
         // Calculate used size and collect leaves
         let mut stack = vec![Arc::clone(&self.root)];
         let mut pq = BinaryHeap::new();
@@ -795,16 +769,13 @@ impl Tree {
             node.tenant_last_access_time.remove(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
-            let parent_opt = node.parent.read().unwrap().upgrade();
+            let parent_opt = node.parent.read().unwrap().clone();
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    let first_char = node.text.read().unwrap().first_char();
-                    if let Some(fc) = first_char {
-                        parent
-                            .children
-                            .remove_if(&fc, |_, child| Arc::ptr_eq(child, &node));
+                    if let Some(fc) = node.text.read().unwrap().first_char() {
+                        parent.children.remove(&fc);
                     }
                 }
             }
@@ -842,7 +813,6 @@ impl Tree {
     }
 
     pub fn remove_tenant(&self, tenant: &str) {
-        let _maintenance = self.maintenance.write().unwrap();
         // Intern tenant ID once for efficient lookups
         let tenant_id = intern_tenant(tenant);
 
@@ -879,16 +849,13 @@ impl Tree {
             curr.tenant_last_access_time.remove(tenant_id.as_ref());
 
             // Get parent reference outside of the borrow scope
-            let parent_opt = curr.parent.read().unwrap().upgrade();
+            let parent_opt = curr.parent.read().unwrap().clone();
 
             // Remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(ref parent) = parent_opt {
-                    let first_char = curr.text.read().unwrap().first_char();
-                    if let Some(fc) = first_char {
-                        parent
-                            .children
-                            .remove_if(&fc, |_, child| Arc::ptr_eq(child, &curr));
+                    if let Some(fc) = curr.text.read().unwrap().first_char() {
+                        parent.children.remove(&fc);
                     }
                 }
             }
@@ -1026,105 +993,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn test_drop_releases_all_nodes_after_split() {
-        let tree = Tree::new();
-        tree.insert("shared prefix one", "worker-a");
-        tree.insert("shared prefix two", "worker-b");
-        tree.insert("shared other", "worker-a");
-        let mut stack = vec![Arc::clone(&tree.root)];
-        let mut nodes = Vec::new();
-        while let Some(node) = stack.pop() {
-            nodes.push(Arc::downgrade(&node));
-            stack.extend(node.children.iter().map(|child| Arc::clone(child.value())));
-        }
-        assert!(nodes.len() > 3);
-        drop(tree);
-        assert!(
-            nodes.iter().all(|node| node.upgrade().is_none()),
-            "dropping a tree must release its root, split nodes and leaves"
-        );
-    }
-
-    #[test]
-    fn test_eviction_releases_removed_leaf_allocations() {
-        let tree = Tree::new();
-        tree.insert("first request", "worker");
-        tree.insert("second request", "worker");
-        let leaves: Vec<_> = tree
-            .root
-            .children
-            .iter()
-            .map(|child| Arc::downgrade(child.value()))
-            .collect();
-        tree.evict_tenant_by_size(0);
-        assert!(tree.root.children.is_empty());
-        assert!(leaves.iter().all(|node| node.upgrade().is_none()));
-    }
-
-    #[test]
-    fn test_repeated_tree_replacement_releases_old_requests() {
-        let mut nodes = Vec::new();
-        for _ in 0..64 {
-            let tree = Tree::new();
-            tree.insert(&"long prompt ".repeat(1024), "worker");
-            nodes.push(Arc::downgrade(&tree.root));
-        }
-        assert_eq!(
-            nodes.iter().filter(|node| node.upgrade().is_some()).count(),
-            0
-        );
-    }
-
-    #[test]
-    fn test_drop_handles_deep_multi_turn_prefixes() {
-        let tree = Tree::new();
-        let mut text = String::new();
-        for _ in 0..4096 {
-            text.push('a');
-            tree.insert(&text, "worker");
-        }
-        let root = Arc::downgrade(&tree.root);
-        drop(tree);
-        assert!(root.upgrade().is_none());
-    }
-
-    #[test]
-    fn test_split_and_destructive_maintenance_are_serialized() {
-        use std::sync::Barrier;
-        for remove in [false, true] {
-            let tree = Arc::new(Tree::new());
-            tree.insert("abcdef", "old");
-            let ready = Arc::new(Barrier::new(3));
-            let insert_tree = Arc::clone(&tree);
-            let insert_ready = Arc::clone(&ready);
-            let insert = thread::spawn(move || {
-                insert_ready.wait();
-                insert_tree.insert("abcXYZ", "new");
-            });
-            let trim_tree = Arc::clone(&tree);
-            let trim_ready = Arc::clone(&ready);
-            let trim = thread::spawn(move || {
-                trim_ready.wait();
-                if remove {
-                    trim_tree.remove_tenant("old");
-                } else {
-                    trim_tree.evict_tenant_by_size(5);
-                }
-            });
-            ready.wait();
-            insert.join().unwrap();
-            trim.join().unwrap();
-            assert_eq!(
-                tree.get_tenant_char_count(),
-                tree.get_used_size_per_tenant()
-            );
-            if remove {
-                assert_eq!(tree.prefix_match_tenant_char_count("abcXYZ", "new"), 6);
-            }
-        }
-    }
 
     /// Helper to convert tenant_char_count to HashMap<String, usize> for comparison
     fn get_maintained_counts(tree: &Tree) -> HashMap<String, usize> {

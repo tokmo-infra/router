@@ -3,10 +3,10 @@
 //! Provides centralized registry for workers with model-based indexing
 
 use crate::core::{ConnectionMode, Worker, WorkerType};
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, RwLock,
+    Arc, RwLock,
 };
 use uuid::Uuid;
 
@@ -43,10 +43,6 @@ type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
-    /// Serialize multi-index mutations; readers never take this lock. Mutation
-    /// helpers must not call public mutators, which would re-lock it.
-    mutation: Mutex<()>,
-
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
@@ -73,7 +69,6 @@ impl WorkerRegistry {
     /// Create a new worker registry
     pub fn new() -> Self {
         Self {
-            mutation: Mutex::new(()),
             workers: Arc::new(DashMap::new()),
             model_workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
@@ -84,22 +79,14 @@ impl WorkerRegistry {
         }
     }
 
-    /// Register or replace a worker, preserving the ID for an existing URL.
+    /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
-        let _mutation = self
-            .mutation
-            .lock()
-            .expect("worker registry mutation poisoned");
-        self.register_unlocked(worker)
-    }
-
-    fn register_unlocked(&self, worker: Arc<dyn Worker>) -> WorkerId {
-        // Drop the URL shard guard before touching workers or any other index.
-        let existing_id = self.url_to_id.get(worker.url()).map(|id| id.clone());
-        let worker_id = existing_id.unwrap_or_default();
-        // A replacement may change model, role or connection mode. Remove the
-        // old worker's memberships (and Arc) before adding the new ones once.
-        self.remove_unlocked(&worker_id);
+        let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
+            // Worker with this URL already exists, update it
+            existing_id.clone()
+        } else {
+            WorkerId::new()
+        };
 
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
@@ -142,75 +129,50 @@ impl WorkerRegistry {
 
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        let _mutation = self
-            .mutation
-            .lock()
-            .expect("worker registry mutation poisoned");
-        let removed = self.remove_unlocked(worker_id);
-        if removed.is_some() {
-            self.notify_worker_state_change();
-        }
-        removed
-    }
+        if let Some((_, worker)) = self.workers.remove(worker_id) {
+            // Remove from URL mapping
+            self.url_to_id.remove(worker.url());
 
-    fn remove_unlocked(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        let (_, worker) = self.workers.remove(worker_id)?;
-        self.url_to_id.remove(worker.url());
-
-        // Entry guards allow retaining and deleting an empty bucket under the
-        // same shard lock, without recursively calling remove on that map.
-        if let Entry::Occupied(mut entry) = self.model_workers.entry(worker.model_id().to_string())
-        {
-            entry.get_mut().retain(|id| id != worker_id);
-            if entry.get().is_empty() {
-                entry.remove();
+            // Remove from model index (both ID-based and optimized)
+            if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
+                model_workers.retain(|id| id != worker_id);
             }
-        }
-        if let Entry::Occupied(entry) = self.model_index.entry(worker.model_id().to_string()) {
-            let empty = {
-                let mut workers = entry
-                    .get()
+
+            // Remove from optimized model index
+            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
+                let worker_url = worker.url();
+                model_index_entry
                     .write()
-                    .expect("RwLock for model_index is poisoned");
-                workers.retain(|w| w.url() != worker.url());
-                workers.is_empty()
-            };
-            if empty {
-                entry.remove();
+                    .expect("RwLock for model_index is poisoned")
+                    .retain(|w| w.url() != worker_url);
             }
-        }
-        if let Entry::Occupied(mut entry) = self.type_workers.entry(worker.worker_type()) {
-            entry.get_mut().retain(|id| id != worker_id);
-            if entry.get().is_empty() {
-                entry.remove();
+
+            // Remove from type index
+            if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
+                type_workers.retain(|id| id != worker_id);
             }
-        }
-        if let Entry::Occupied(mut entry) = self.connection_workers.entry(worker.connection_mode())
-        {
-            entry.get_mut().retain(|id| id != worker_id);
-            if entry.get().is_empty() {
-                entry.remove();
+
+            // Remove from connection mode index
+            if let Some(mut conn_workers) =
+                self.connection_workers.get_mut(&worker.connection_mode())
+            {
+                conn_workers.retain(|id| id != worker_id);
             }
+
+            self.notify_worker_state_change();
+            Some(worker)
+        } else {
+            None
         }
-        Some(worker)
     }
 
     /// Remove a worker by URL
     pub fn remove_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        let _mutation = self
-            .mutation
-            .lock()
-            .expect("worker registry mutation poisoned");
-        let removed = self.remove_by_url_unlocked(url);
-        if removed.is_some() {
-            self.notify_worker_state_change();
+        if let Some((_, worker_id)) = self.url_to_id.remove(url) {
+            self.remove(&worker_id)
+        } else {
+            None
         }
-        removed
-    }
-
-    fn remove_by_url_unlocked(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        let worker_id = self.url_to_id.get(url).map(|id| id.clone())?;
-        self.remove_unlocked(&worker_id)
     }
 
     /// Get a worker by ID
@@ -220,18 +182,15 @@ impl WorkerRegistry {
 
     /// Get a worker by URL
     pub fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        let worker_id = self.url_to_id.get(url).map(|id| id.clone())?;
-        self.get(&worker_id)
+        self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
     /// Get all workers for a model
     pub fn get_by_model(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
-        let ids = self
-            .model_workers
+        self.model_workers
             .get(model_id)
-            .map(|ids| ids.clone())
-            .unwrap_or_default();
-        ids.iter().filter_map(|id| self.get(id)).collect()
+            .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
+            .unwrap_or_default()
     }
 
     /// Get all workers for a model (O(1) optimized version)
@@ -270,12 +229,10 @@ impl WorkerRegistry {
 
     /// Get all workers by worker type
     pub fn get_by_type(&self, worker_type: &WorkerType) -> Vec<Arc<dyn Worker>> {
-        let ids = self
-            .type_workers
+        self.type_workers
             .get(worker_type)
-            .map(|ids| ids.clone())
-            .unwrap_or_default();
-        ids.iter().filter_map(|id| self.get(id)).collect()
+            .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
+            .unwrap_or_default()
     }
 
     /// Get all prefill workers (regardless of bootstrap_port)
@@ -299,12 +256,10 @@ impl WorkerRegistry {
 
     /// Get all workers by connection mode
     pub fn get_by_connection(&self, connection_mode: &ConnectionMode) -> Vec<Arc<dyn Worker>> {
-        let ids = self
-            .connection_workers
+        self.connection_workers
             .get(connection_mode)
-            .map(|ids| ids.clone())
-            .unwrap_or_default();
-        ids.iter().filter_map(|id| self.get(id)).collect()
+            .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
+            .unwrap_or_default()
     }
 
     /// Get all workers
@@ -465,6 +420,7 @@ impl WorkerRegistry {
                         revision.fetch_add(1, Ordering::AcqRel);
                     }
                 }
+
             }
         });
 
@@ -493,183 +449,8 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, CircuitBreakerConfig, WorkerFactory};
+    use crate::core::{CircuitBreakerConfig, WorkerFactory};
     use std::collections::HashMap;
-
-    fn memory_worker(
-        model: &str,
-        worker_type: WorkerType,
-        mode: ConnectionMode,
-    ) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorker::with_connection_mode("http://same:8000".into(), worker_type, mode)
-                .with_labels(HashMap::from([("model_id".into(), model.into())])),
-        )
-    }
-
-    fn assert_registry_empty(registry: &WorkerRegistry) {
-        assert!(registry.workers.is_empty());
-        assert!(registry.url_to_id.is_empty());
-        assert!(registry.model_workers.is_empty());
-        assert!(registry.model_index.is_empty());
-        assert!(registry.type_workers.is_empty());
-        assert!(registry.connection_workers.is_empty());
-    }
-
-    #[test]
-    fn memory_regression_register_same_url_32_times_is_idempotent() {
-        let registry = WorkerRegistry::new();
-        let mut first_id = None;
-        let mut old_workers = Vec::new();
-        for _ in 0..32 {
-            let worker = memory_worker("model", WorkerType::Regular, ConnectionMode::Http);
-            old_workers.push(Arc::downgrade(&worker));
-            let id = registry.register(worker);
-            assert_eq!(first_id.get_or_insert(id.clone()), &id);
-        }
-        assert_eq!(registry.workers.len(), 1);
-        assert_eq!(registry.url_to_id.len(), 1);
-        assert_eq!(registry.get_by_model("model").len(), 1);
-        assert_eq!(registry.get_by_model_fast("model").len(), 1);
-        assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
-        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
-        assert!(old_workers[..31]
-            .iter()
-            .all(|worker| worker.upgrade().is_none()));
-        registry.remove_by_url("http://same:8000");
-        assert!(old_workers.iter().all(|worker| worker.upgrade().is_none()));
-        assert_registry_empty(&registry);
-    }
-
-    #[test]
-    fn memory_regression_update_releases_old_model_type_connection_and_worker() {
-        let registry = WorkerRegistry::new();
-        let prefill = WorkerType::Prefill {
-            bootstrap_port: Some(1234),
-        };
-        let old = memory_worker("old-model", prefill.clone(), ConnectionMode::Http);
-        let old_weak = Arc::downgrade(&old);
-        let id = registry.register(old);
-        let replacement = memory_worker("new-model", WorkerType::Decode, ConnectionMode::Grpc);
-        let replacement_weak = Arc::downgrade(&replacement);
-        assert_eq!(registry.register(replacement), id);
-        assert!(
-            old_weak.upgrade().is_none(),
-            "old model index retained the worker"
-        );
-        assert!(!registry.model_workers.contains_key("old-model"));
-        assert!(!registry.model_index.contains_key("old-model"));
-        assert!(!registry.type_workers.contains_key(&prefill));
-        assert!(!registry
-            .connection_workers
-            .contains_key(&ConnectionMode::Http));
-        assert_eq!(registry.get_by_model_fast("new-model").len(), 1);
-        assert_eq!(registry.get_decode_workers().len(), 1);
-        assert_eq!(registry.get_by_connection(&ConnectionMode::Grpc).len(), 1);
-        registry.remove(&id);
-        assert!(replacement_weak.upgrade().is_none());
-        assert_registry_empty(&registry);
-    }
-
-    #[test]
-    fn memory_regression_model_churn_does_not_keep_empty_buckets() {
-        let registry = WorkerRegistry::new();
-        for index in 0..32 {
-            registry.register(memory_worker(
-                &format!("model-{index}"),
-                WorkerType::Regular,
-                ConnectionMode::Http,
-            ));
-            assert_eq!(registry.model_workers.len(), 1);
-            assert_eq!(registry.model_index.len(), 1);
-        }
-        registry.remove_by_url("http://same:8000");
-        assert_registry_empty(&registry);
-    }
-
-    #[test]
-    fn memory_regression_concurrent_same_url_has_one_id_and_one_index_entry() {
-        use std::sync::{mpsc, Barrier};
-        use std::time::Duration;
-        let registry = Arc::new(WorkerRegistry::new());
-        let barrier = Arc::new(Barrier::new(32));
-        let (tx, rx) = mpsc::channel();
-        let mut handles = Vec::new();
-        for _ in 0..32 {
-            let (registry, barrier, tx) = (registry.clone(), barrier.clone(), tx.clone());
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                let id = registry.register(memory_worker(
-                    "model",
-                    WorkerType::Regular,
-                    ConnectionMode::Http,
-                ));
-                tx.send(id).unwrap();
-            }));
-        }
-        drop(tx);
-        let ids: std::collections::HashSet<_> = (0..32)
-            .map(|_| {
-                rx.recv_timeout(Duration::from_secs(10))
-                    .expect("registry mutation deadlocked")
-            })
-            .collect();
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        assert_eq!(ids.len(), 1);
-        assert_eq!(registry.workers.len(), 1);
-        assert_eq!(registry.get_by_model_fast("model").len(), 1);
-        assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
-        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
-        registry.remove_by_url("http://same:8000");
-        assert_registry_empty(&registry);
-    }
-
-    #[test]
-    fn memory_regression_concurrent_register_remove_and_lookup_leave_no_orphans() {
-        use std::sync::{mpsc, Barrier};
-        use std::time::Duration;
-        let registry = Arc::new(WorkerRegistry::new());
-        let barrier = Arc::new(Barrier::new(8));
-        let (tx, rx) = mpsc::channel();
-        let mut handles = Vec::new();
-        for thread in 0..8 {
-            let (registry, barrier, tx) = (registry.clone(), barrier.clone(), tx.clone());
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                for round in 0..64 {
-                    let model = format!("model-{thread}-{}", round % 2);
-                    let id = registry.register(memory_worker(
-                        &model,
-                        WorkerType::Regular,
-                        ConnectionMode::Http,
-                    ));
-                    registry.get_by_url("http://same:8000");
-                    registry.get_by_model(&model);
-                    registry.get_by_model_fast(&model);
-                    registry.get_by_type(&WorkerType::Regular);
-                    registry.get_by_connection(&ConnectionMode::Http);
-                    if round % 2 == 0 {
-                        registry.remove(&id);
-                    } else {
-                        registry.remove_by_url("http://same:8000");
-                    }
-                }
-                tx.send(()).unwrap();
-            }));
-        }
-        drop(tx);
-        for _ in 0..8 {
-            rx.recv_timeout(Duration::from_secs(10))
-                .expect("registry lookup/mutation deadlocked");
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        registry.remove_by_url("http://same:8000");
-        assert_registry_empty(&registry);
-    }
 
     #[test]
     fn test_worker_registry() {

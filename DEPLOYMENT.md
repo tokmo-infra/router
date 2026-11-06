@@ -33,18 +33,6 @@ export VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1
 
 `/workers`中应包含全部预期rank并处于健康状态，再接入业务。不要在已有服务端口上重复启动。`glm53flash-integration.json`保留历史构建凭据，不代表新源码已自动进入旧镜像。
 
-### 长期运行的内存清理
-
-新版会在策略退出时停止淘汰线程，移除最后一个worker时删除对应模型树；可选耦合监测也会停止已删除服务的轮询。缓存树使用弱父指针，替换和删除后释放请求文本。
-
-同URL重复注册按更新处理，旧模型/角色索引一并释放。删除PD基础地址时清理其全部`@rank`及策略缓存；删除指定rank只处理该rank。缓存树的拆分与淘汰按统一维护锁执行，避免清理线程与请求插入互相等待。
-
-缓存感知路由沿用`--eviction-interval 120`和`--max-tree-size 67108864`的CLI默认值：每120秒按LRU淘汰，每轮将每个worker的保留字符数削减到该值以内。这个值是前缀树的逻辑容量，进程内存还包括树节点、在途请求、分词器及其他状态。可按模型和容器内存预算调整，记录所用值。
-
-配置API key远端校验后，结果缓存固定上限4096条；成功TTL为300秒，401/403拒绝TTL为30秒，单key超过8192字节时只校验、不缓存。缓存访问时清理过期记录，满额时淘汰最早过期项；校验服务超时或返回服务错误时，下次请求重新校验。
-
-部署时重新构建并记录镜像ID和ELF SHA256，已有镜像继续运行其原始代码。
-
 ## 2. 默认复用P的分词结果
 
 长多轮请求在P完成分词后，D直接使用P返回的token ID，减少重复渲染模板和分词带来的CPU开销。此优化移植自`08d71951`，聊天接口默认开启，也可显式配置：
@@ -131,9 +119,3 @@ for mode in default on off; do
     --output "/tmp/pd-prompt-ids-${mode}.json"
 done
 ```
-
-### PD 分词估算加速（可选）
-
-`VLLM_ROUTER_PD_FAST_TOKENIZER=1` 仅将 TokenBalancer 估算编码换为固定 tokenizers 1.0.0-rc.3；默认0保留旧路径。旧 tokenizer 经官方 canonicalize 转换，仅在内存中用于估算，当前限定已验收的 DS 空 normalizer/BPE。BPE cache 容量仍沿用原配置（本组0），12槽/16核/64GiB不变。
-
-先核 token IDs、256-token页哈希和输出预算一致，再做完整估算CPU对照及真实PD联调。模型 tokenizer、请求体、P/D采样、异步调度、Graph、KV/RDMA及Mooncake生命周期不改；CPU收益不代表模型吞吐或SLO。回滚移除此环境变量或恢复旧Router镜像。

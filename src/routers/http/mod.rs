@@ -6,7 +6,6 @@ pub mod openai_router;
 pub mod pd_router;
 pub mod pd_types;
 mod pd_usage;
-mod pd_timeout;
 mod program_adapter;
 pub mod router;
 mod token_balance;

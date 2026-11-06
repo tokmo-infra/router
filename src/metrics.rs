@@ -19,20 +19,6 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
-    describe_histogram!("vllm_router_pd_stage_wait_seconds", "Direct PD headers/first-body wait; includes upstream queue and computation, not pure network latency");
-    describe_histogram!("vllm_router_pd_first_decode_body_seconds", "Time since PD selection started to first decode body byte; not necessarily first generated token");
-    describe_histogram!(
-        "vllm_router_frontend_admission_wait_seconds",
-        "Frontend rate/concurrency admission wait, including cancellation"
-    );
-    describe_gauge!(
-        "vllm_router_pd_stage_waiting",
-        "Current direct PD requests awaiting headers or first body data"
-    );
-    describe_counter!(
-        "vllm_router_pd_timeout_total",
-        "Direct PD timeouts by connect, first_response, body_idle, or total phase"
-    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",
@@ -418,17 +404,6 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60));
     let builder = set_program_scheduling_buckets(builder);
-    let builder = [
-        "vllm_router_pd_stage_wait_seconds",
-        "vllm_router_pd_first_decode_body_seconds",
-        "vllm_router_frontend_admission_wait_seconds",
-    ]
-    .into_iter()
-    .fold(builder, |builder, name| {
-        builder
-            .set_buckets_for_metric(Matcher::Full(name.into()), &duration_bucket)
-            .expect("failed to set PD wait buckets")
-    });
     builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")

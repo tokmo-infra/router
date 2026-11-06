@@ -1,10 +1,6 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
-#[path = "pd_request_trace.rs"]
-mod pd_request_trace;
-use pd_request_trace::RequestTrace;
 use super::dp_utils;
-use super::pd_timeout::{PdBudget, PdTimeouts};
 use super::token_balance::{TokenBalancer, Reservation as TokenReservation};
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
@@ -56,10 +52,6 @@ pub struct VllmPDRouter {
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
     http_client: reqwest::Client,
-    pd_client: reqwest::Client,
-    pd_timeouts: PdTimeouts,
-    /// Opt-in P-only stopping contract, scoped to direct Mooncake Chat/Completions.
-    prefill_force_length_cap: bool,
     /// Policy registry for load balancing
     policy_registry: Arc<PolicyRegistry>,
     /// Whether this router uses service discovery (true) or direct URLs (false)
@@ -189,18 +181,17 @@ impl VllmPDRouter {
     async fn select_direct_pair(
         &self, ps: &[Arc<dyn Worker>], ds: &[Arc<dyn Worker>],
         request: &Value, text: Option<&str>, headers: Option<&RequestHeaders>,
-    ) -> Result<(usize, usize, OwnedLoadReservation, Option<TokenReservation>, PdBudget), String> {
-        let budget = self.pd_timeouts.start();
+    ) -> Result<(usize, usize, OwnedLoadReservation, Option<TokenReservation>), String> {
         if let Some(b) = &self.token_balancer {
-            let estimate = budget.until_total(b.estimate_async(request)).await.map_err(|e| e.to_string())??;
+            let estimate = b.estimate_async(request).await?;
             let (p,d,pr,dr) = b.select(ps,ds,estimate).ok_or("no available PD workers")?;
             let mut reservation = OwnedLoadReservation::new(ds[d].clone());
             reservation.1 = Some(dr);
-            return Ok((p,d,reservation,Some(pr),budget));
+            return Ok((p,d,reservation,Some(pr)));
         }
         let p = self.policy_registry.get_prefill_policy().select_worker_with_headers(ps,text,headers).ok_or("no prefill workers")?;
         let (d,r) = select_and_reserve_decode(&self.decode_admission,self.policy_registry.get_decode_policy().as_ref(),ds,text,headers).ok_or("no decode workers")?;
-        Ok((p,d,r,None,budget))
+        Ok((p,d,r,None))
     }
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
@@ -739,30 +730,6 @@ impl VllmPDRouter {
             obj.remove("stream_options");
         }
         request
-    }
-
-    fn prepare_direct_prefill_request(&self, request: Value, path: &str) -> Result<Value, PDRouterError> {
-        let force = self.prefill_force_length_cap
-            && !self.use_discovery
-            && matches!(self.kv_connector, KvConnector::Mooncake)
-            && matches!(path, "/v1/chat/completions" | "/v1/completions");
-        if force && request.get("use_beam_search").and_then(Value::as_bool) == Some(true) {
-            return Err(PDRouterError::InvalidConfiguration {
-                reason: "Mooncake P force-length-cap does not support beam search".into(),
-            });
-        }
-        let mut request = Self::prepare_prefill_request(request, path);
-        if force {
-            // Native Mooncake retains P KV only for FINISHED_LENGTH_CAPPED.
-            // 0.33 Chat/CompletionRequest exposes these top-level fields. The
-            // server may merge default stop IDs back in; min_tokens masks them
-            // on the first sample. Do not touch thinking/template/D parameters.
-            request["ignore_eos"] = json!(true);
-            request["min_tokens"] = json!(1);
-            request["stop"] = json!([]);
-            request["stop_token_ids"] = json!([]);
-        }
-        Ok(request)
     }
 
     fn reuse_prefill_prompt_ids(path: &str) -> bool {
@@ -1454,23 +1421,6 @@ impl VllmPDRouter {
     /// The direct route owns decode admission through response-body completion.
     /// Prefill uses an independent cancellation-safe reservation.
     async fn process_vllm_two_stage_request(
-        &self, original_request: Value, prefill_worker: Arc<dyn Worker>,
-        decode_worker: Arc<dyn Worker>, path: &str, headers: Option<&HeaderMap>,
-        prefill_token_reservation: Option<TokenReservation>, budget: PdBudget,
-        mut request_trace: RequestTrace,
-    ) -> Result<Response, PDRouterError> {
-        let result = budget.until_total(self.process_vllm_two_stage_request_inner(
-            original_request, prefill_worker, decode_worker, path, headers,
-            prefill_token_reservation, budget, &request_trace,
-        )).await.map_err(|e| PDRouterError::NetworkError { message: e.to_string() });
-        match result {
-            Ok(Ok(response)) => Ok(request_trace.response(response)),
-            Ok(Err(error)) => { request_trace.finish("error"); Err(error) }
-            Err(error) => { request_trace.finish("timeout"); Err(error) }
-        }
-    }
-
-    async fn process_vllm_two_stage_request_inner(
         &self,
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
@@ -1478,8 +1428,6 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         prefill_token_reservation: Option<TokenReservation>,
-        budget: PdBudget,
-        request_trace: &RequestTrace,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -1488,8 +1436,6 @@ impl VllmPDRouter {
             .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
             .await
         {
-            request_trace.bridge(&request_id, None);
-            request_trace.stage("concurrent_path_not_phase_traced");
             return self
                 .process_concurrent_two_stage(
                     prefill_request,
@@ -1529,11 +1475,10 @@ impl VllmPDRouter {
         );
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
-        let mut prefill_request = self.prepare_direct_prefill_request(original_request.clone(), path)?;
+        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
-        request_trace.bridge(&request_id, transfer_id.as_deref());
 
         // Add kv_transfer_params for KV connector support at top level
         let decode_base_url = decode_worker.base_url().to_string();
@@ -1577,7 +1522,8 @@ impl VllmPDRouter {
         self.start_profiling(&prefill_base_url).await;
 
         let mut prefill_request_builder = self
-            .pd_client
+            .pd_router
+            .client
             .post(&prefill_url)
             .header("Content-Type", "application/json")
             .header(
@@ -1593,9 +1539,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        // Dispatch entry BEFORE .json serialization, not proof bytes are on the wire.
-        request_trace.stage("p_dispatch");
-        let prefill_response = match budget.send(
+        let prefill_response = match otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
             ClientRequestOptions {
@@ -1620,7 +1564,6 @@ impl VllmPDRouter {
             }
         };
 
-        request_trace.stage("p_headers");
         debug!("📥 Prefill response status: {}", prefill_response.status());
         debug!(
             "📥 Prefill response headers: {:?}",
@@ -1646,7 +1589,6 @@ impl VllmPDRouter {
             }
         };
 
-        request_trace.stage("p_body_done");
         debug!(
             "📥 Prefill response body size: {} bytes",
             prefill_bytes.len()
@@ -1751,7 +1693,8 @@ impl VllmPDRouter {
         self.start_profiling(&decode_base_url).await;
 
         let mut decode_request_builder = self
-            .pd_client
+            .pd_router
+            .client
             .post(&decode_url)
             .header("Content-Type", "application/json")
             .header(
@@ -1767,12 +1710,8 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        // Dispatch entry BEFORE .json serialization, not proof bytes are on the wire.
-        request_trace.stage("d_dispatch");
-        let decode_request_builder = decode_request_builder.json(&decode_request);
-        request_trace.stage("d_json_ready");
-        let decode_response = match budget.send(
-            decode_request_builder,
+        let decode_response = match otel_http::send_client_request(
+            decode_request_builder.json(&decode_request),
             headers,
             ClientRequestOptions {
                 method: "POST",
@@ -1797,7 +1736,6 @@ impl VllmPDRouter {
             }
         };
 
-        request_trace.stage("d_headers");
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
@@ -1835,11 +1773,10 @@ impl VllmPDRouter {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
             // Read decode response body
-            let decode_body = if request_trace.enabled() {
-                request_trace.collect_body(decode_response.bytes_stream()).await
-            } else {
-                decode_response.bytes().await
-            }
+            let decode_body =
+                decode_response
+                    .bytes()
+                    .await
                     .map_err(|e| PDRouterError::NetworkError {
                         message: format!(
                             "Failed to read decode response from {}: {}",
@@ -1894,11 +1831,7 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = if request_trace.enabled() {
-                Body::from_stream(request_trace.observe_stream(decode_response.bytes_stream()))
-            } else {
-                Body::from_stream(decode_response.bytes_stream())
-            };
+            let body = Body::from_stream(decode_response.bytes_stream());
             response_builder
                 .body(body)
                 .map_err(|e| PDRouterError::NetworkError {
@@ -2106,14 +2039,6 @@ impl VllmPDRouter {
     ) -> Result<Self, String> {
         let kv_connector = ctx.router_config.kv_connector;
         let http_client = reqwest::Client::new();
-        let pd_timeouts = PdTimeouts::from_env(ctx.router_config.request_timeout_secs)?;
-        let pd_client = pd_timeouts.client()?;
-        let prefill_force_length_cap = std::env::var("VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP")
-            .ok().as_deref() == Some("1");
-        if prefill_force_length_cap {
-            info!(applicable = matches!(kv_connector, KvConnector::Mooncake) && discovery_address.is_none(),
-                "P force-length-cap configured: direct Mooncake Chat/Completions only");
-        }
 
         if let Some(ref addr) = discovery_address {
             // Discovery mode
@@ -2143,9 +2068,6 @@ impl VllmPDRouter {
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
-                pd_client,
-                pd_timeouts,
-                prefill_force_length_cap,
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: true,
                 enable_profiling: ctx.router_config.enable_profiling,
@@ -2243,9 +2165,6 @@ impl VllmPDRouter {
                 pd_router,
                 service_registry: Arc::new(service_registry),
                 http_client,
-                pd_client,
-                pd_timeouts,
-                prefill_force_length_cap,
                 policy_registry: ctx.policy_registry.clone(),
                 use_discovery: false,
                 enable_profiling: ctx.router_config.enable_profiling,
@@ -2394,7 +2313,6 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let request_trace = RequestTrace::new(headers, !self.use_discovery);
         info!(
             "vLLM route_chat called, use_discovery={}",
             self.use_discovery
@@ -2487,8 +2405,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            request_trace.stage("selection_start");
-            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation, budget) =
+            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
                     request_str, request_headers.as_ref()).await {
                     Ok(v) => v,
@@ -2497,7 +2414,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            request_trace.selected(prefill_worker.base_url(), prefill_worker.dp_rank(), decode_worker.base_url(), decode_worker.dp_rank());
             let buffered_response = is_buffered_logprobs_response(&request_json);
             // Decode reservation covers selection, both stages, and the response body.
 
@@ -2518,8 +2434,6 @@ impl RouterTrait for VllmPDRouter {
                     "/v1/chat/completions",
                     headers,
                     prefill_token_reservation,
-                    budget,
-                    request_trace,
                 )
                 .await
             {
@@ -2546,7 +2460,6 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let request_trace = RequestTrace::new(headers, !self.use_discovery);
         info!(
             "vLLM route_completion called, use_discovery={}",
             self.use_discovery
@@ -2639,8 +2552,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            request_trace.stage("selection_start");
-            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation, budget) =
+            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
                     request_str, request_headers.as_ref()).await {
                     Ok(v) => v,
@@ -2649,7 +2561,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            request_trace.selected(prefill_worker.base_url(), prefill_worker.dp_rank(), decode_worker.base_url(), decode_worker.dp_rank());
             let buffered_response = is_buffered_logprobs_response(&request_json);
             // Decode reservation covers selection, both stages, and the response body.
 
@@ -2670,8 +2581,6 @@ impl RouterTrait for VllmPDRouter {
                     "/v1/completions",
                     headers,
                     prefill_token_reservation,
-                    budget,
-                    request_trace,
                 )
                 .await
             {
@@ -2776,7 +2685,6 @@ impl RouterTrait for VllmPDRouter {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
-        let request_trace = RequestTrace::new(headers, !self.use_discovery);
         // Only handle POST requests for inference
         if *method != Method::POST {
             return (
@@ -2842,8 +2750,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            request_trace.stage("selection_start");
-            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation, budget) =
+            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
                     request_str, request_headers.as_ref()).await {
                     Ok(v) => v,
@@ -2852,7 +2759,6 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
-            request_trace.selected(prefill_worker.base_url(), prefill_worker.dp_rank(), decode_worker.base_url(), decode_worker.dp_rank());
             let buffered_response = is_buffered_logprobs_response(&request_json);
 
             debug!(
@@ -2870,8 +2776,6 @@ impl RouterTrait for VllmPDRouter {
                     path,
                     headers,
                     prefill_token_reservation,
-                    budget,
-                    request_trace,
                 )
                 .await
             {
@@ -2910,10 +2814,6 @@ impl WorkerManagement for VllmPDRouter {
         self.pd_router.get_worker_urls()
     }
 }
-
-#[cfg(test)]
-#[path = "pd_timeout_tests.rs"]
-mod timeout_regressions;
 
 #[cfg(test)]
 mod tests {
