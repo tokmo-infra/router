@@ -745,8 +745,7 @@ impl VllmPDRouter {
 
     fn reuse_prefill_prompt_ids(path: &str) -> bool {
         path == "/v1/chat/completions"
-            && std::env::var("VLLM_ROUTER_PD_REUSE_PROMPT_IDS")
-                .map_or(true, |value| value == "1")
+            && std::env::var("VLLM_ROUTER_PD_REUSE_PROMPT_IDS").as_deref() == Ok("1")
     }
 
     fn attach_prefill_prompt_ids(response: &Value, params: &mut Value) -> Result<(), String> {

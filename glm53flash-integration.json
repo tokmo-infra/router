@@ -1,10 +1,9 @@
 {
-  "name": "glm5.3-flash-1103",
+  "name": "vllm-0.32.0-0.1.16-glm5.3-flash",
   "router_version": "0.1.16",
   "source_base": "db02f358da401b60d4ae14eb286163763a0705cc",
-  "source_snapshot": "08d7195149fda3fc0ef7efbdb2c92dd787fcf60e",
-  "deployed_image": "sha256:c07f71ef603b3c28c2f2b48e0657c4c96fcee285428dcd64747ed53a3d3aeec5",
-  "deployed_binary_sha256": "6c51e70abc6a668a716b4738f448b5c2034559d63c3fe2c18d73352a95f99448",
+  "deployed_image": "sha256:0eee14a71f7b8027f0235bfb8b99eebc8416ca7cbf07b6776577fbd944810413",
+  "deployed_extension_sha256": "7096f5d8847141dc7a49f33ba1ca25beb937c7dd76209660c1e022e6c566f6e7",
   "source_files": [
     {
       "path": "Cargo.lock",
@@ -19,47 +18,30 @@
       "sha256": "c29e668532a3cf0b8361ca411c4354d3f0f07ccf2103ef21272b46f0b2c33675"
     },
     {
-      "path": "src/metrics.rs",
-      "sha256": "de5f65f6dac336b1ce41a5953593b1d0f53d192a79c13127cd59b18ef39ccbd1"
-    },
-    {
-      "path": "src/policies/cache_aware.rs",
-      "sha256": "18ba044ae252eb3a0baa24021073ffa2bb88aac2efb4072c06f16580e09791a6"
-    },
-    {
-      "path": "src/policies/coupled_kv.rs",
-      "sha256": "906c06a10f90e9c94cfbd9fe1e2b91cc33b4757f57c88e36ff2efa5dbca87601"
-    },
-    {
-      "path": "src/policies/mod.rs",
-      "sha256": "4a213ce78d081754d36c0c87e9612d990ee6b692c07f3c96398e975416376f96"
-    },
-    {
       "path": "src/protocols/spec.rs",
       "sha256": "601bfb0f75577809ef8ca59230eb5d1d963e27c8526dd97b61b601fdc897bb09"
     },
     {
       "path": "src/routers/http/mod.rs",
-      "sha256": "0750eb4722323c8107d3161b27427b873e0055bb80fa4fc93d05a7cdaaf1e547"
+      "sha256": "99c05e84d0ee9a265e38872ada561ae730e70c1eb406ca11ad7c303b262e4427"
     },
     {
       "path": "src/routers/http/pd_usage.rs",
       "sha256": "b59e4e11bf5e5e14bc32e7a64c9eec5da1a8b67c69375867439c325fd26c3a48"
     },
     {
-      "path": "src/routers/http/token_balance.rs",
-      "sha256": "01a86f975fe0326b67a4b7406f82e37bc139d7de16c3cd5a149b37e644234ea7"
-    },
-    {
       "path": "src/routers/http/vllm_pd_router.rs",
-      "sha256": "572beacbaefc29e87037165014e2ebe9ef6eb54b4250db725f9754c0e5b108b5"
+      "sha256": "bebb9a2154df9b1fc1114fe08f959d220cd6cd8459a58a559f45d3509875e1cd"
     }
   ],
   "vllm_repository": "https://github.com/tokmo-infra/vllm",
-  "vllm_branch": "glm5.3-flash-1103",
-  "router_deployment": "DEPLOYMENT.md",
-  "default_features": {
-    "pd_reuse_prompt_ids": true
+  "vllm_branch": "vllm-0.32.0-0.1.16-glm5.3-flash",
+  "C230_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT-C230.md",
+  "validation": {
+    "CPU_tests": "reuse original Linux test binary built from matching archived source",
+    "reservation_cases": 5,
+    "pd_usage_cases": 12,
+    "kv_hash_cases": 6
   },
-  "vllm_deployment": "deployment4p4d.md"
+  "current_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT.md"
 }
