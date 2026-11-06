@@ -69,7 +69,7 @@ export VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG=/path/to/token-balance.json
 - P按未完成请求的估算计算量分流：`q + q*(c+q/2)/131072`，q为新增输入，c为估算可复用前缀。
 - 成功P响应形成前缀观察，跨P共享，按模型及cache_salt隔离，有效期60秒。
 - D同时比较请求数和容量归一化KV需求，包含输出预算和余量；在流结束或取消时释放预占。
-- 分词最多四路并行，避免重复保留大请求BPE缓存。估算只用于选路，统计使用后端实际usage。
+- 分词估算默认四路并行；可设VLLM_ROUTER_PD_TOKENIZATION_CONCURRENCY=32，合法范围1–128。只调整CPU估算槽位，不改变HTTP/SSE、P/D采样或KV交接。保留关闭重复BPE词缓存的行为。估算只用于选路，统计使用后端实际usage。
 - 可选`prefill_kv_guard=true`参考P真实KV压力，每秒刷新，五秒以上旧观测不参与选路。它是选路优先级，不是硬性准入或GPU抢占修复。
 
 ## 4. 耦合实例逐DP路由
@@ -119,3 +119,7 @@ for mode in default on off; do
     --output "/tmp/pd-prompt-ids-${mode}.json"
 done
 ```
+
+## B300回归配置说明
+
+CPU不设quota/cpuset；估算槽位显式32并观测slot_wait/compute，不保证零排队。API共享分词缓存及L1沿用现役32GiB/64MiB配置，不为Router更换重启P/D。前缀观察表采用262144条LRU上限、60秒有效性；到期不参与命中但不等于立即物理删除。cache_aware树按每tenant字符数上限淘汰，并非严格RSS字节配额；建议较短淘汰周期配合进程64GiB内存上限观察。

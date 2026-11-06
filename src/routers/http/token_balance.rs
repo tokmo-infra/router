@@ -23,6 +23,15 @@ struct Config {
     #[serde(default)]
     prefill_kv_guard: bool,
 }
+// Bound CPU estimation fanout independently of inference and HTTP streaming.
+// Unset preserves the original four-slot behavior; deployments may choose more.
+fn tokenization_concurrency(value: Option<&str>) -> Result<usize, String> {
+    match value {
+        None => Ok(4),
+        Some(v) => v.parse::<usize>().ok().filter(|n| (1..=128).contains(n))
+            .ok_or_else(|| "VLLM_ROUTER_PD_TOKENIZATION_CONCURRENCY must be 1..=128".to_owned()),
+    }
+}
 fn default_headroom() -> f64 { 0.85 }
 #[derive(Debug, Default)]
 struct Demand { requests: usize, kv: f64, work: f64 }
@@ -145,7 +154,9 @@ impl TokenBalancer {
         }
         tracing::info!(workers=config.workers.len(), kv_fraction=config.kv_fraction, "PD token balance enabled (heuristic cost; estimated token demand)");
         let enabled=config.prefill_kv_guard;
-        let result=Arc::new(Self { config, tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(4)), state: Mutex::new(State {
+        let slots=tokenization_concurrency(std::env::var("VLLM_ROUTER_PD_TOKENIZATION_CONCURRENCY").ok().as_deref())?;
+        tracing::info!(slots, "PD CPU tokenization slots");
+        let result=Arc::new(Self { config, tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(slots)), state: Mutex::new(State {
             demand: HashMap::new(), live_kv:HashMap::new(), prefixes: LruCache::new(NonZeroUsize::new(262144).unwrap()),
         }) });
         if enabled { Self::start_kv_watch(&result); }
@@ -261,6 +272,14 @@ impl TokenBalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn configurable_estimation_slots_are_bounded() {
+        assert_eq!(tokenization_concurrency(None).unwrap(),4);
+        assert_eq!(tokenization_concurrency(Some("32")).unwrap(),32);
+        assert_eq!(tokenization_concurrency(Some("128")).unwrap(),128);
+        for v in ["0", "129", "-1", "not-a-number"] {
+            assert!(tokenization_concurrency(Some(v)).is_err());
+        }
+    }
     fn fixture() -> (Arc<TokenBalancer>, Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>) {
         use crate::core::{BasicWorker,WorkerType};
         let ps:Vec<Arc<dyn Worker>>=vec![Arc::new(BasicWorker::new("http://p:1".into(),WorkerType::Regular))];

@@ -44,3 +44,7 @@
 | ③ 复用交接观测 | 需要确认Router是否已经把P的分词结果交给D。 | 增加`vllm_router_pd_prompt_ids_reused_total`交接计数。 | **通用观测能力**；计数表示Router已准备交接，D实际复用及耗时看后端。 |
 
 复用路径等P返回分词结果后再派发D，推理引擎仍使用原生异步调度。HTTP、SSE、DP rank传递和后端usage统计继续沿用原路径。完整4P4D引擎与缓存启动命令见vLLM同名1103分支的`deployment4p4d.md`。
+
+## Router代码基线
+
+保留69a77e9的GLM5.3 Flash功能与默认P→D token ID复用；Rust传输/路由及Cargo依赖对齐B300参考f04c4a6，不带后加的DS4.1分阶段超时、独立PD客户端、SSE封装或快速分词试验。P/D模型服务与HCA、分词缓存配置不属于本次代码回退范围。参考代码来源不等于本次新镜像已通过真实长负载验收。
