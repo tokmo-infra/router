@@ -43,5 +43,5 @@
     "pd_usage_cases": 12,
     "kv_hash_cases": 6
   },
-  "current_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT.md"
+  "current_deployment": "https://github.com/tokmo-infra/router/blob/glm5.3-flash-1103/DEPLOYMENT.md"
 }

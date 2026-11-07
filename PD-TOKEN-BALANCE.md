@@ -1,5 +1,7 @@
 # P/D token 负载路由
 
+本文仅说明可选源码功能。当前 4P4D 使用 [DEPLOYMENT.md](DEPLOYMENT.md) 的 D 轮询方案，不启用 TokenBalancer，不生成或挂载本文的 JSON。
+
 环境变量 VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG 指向 JSON 配置。配置包含 tokenizer_path、kv_fraction（本轮 0.85）、workers。workers 以实例基础 URL 为键，填写实际 server_info 的每路 kv_tokens 和 max_seqs。
 
 - P：按未完成请求的估算计算量分流；公式 q + q*(c+q/2)/131072，q 为估算新增输入，c 为估算可复用前缀。
@@ -15,11 +17,3 @@
 指标：vllm_router_pd_token_balance_selected_total、vllm_router_pd_assigned_requests、vllm_router_pd_assigned_kv_tokens_estimate、vllm_router_pd_live_kv_usage。
 
 `vllm_router_pd_estimation_seconds{phase=...}` 拆分分词槽等待（slot_wait）、阻塞线程池等待（blocking_wait）、分词及前缀估算（compute）和估算全程（total）。这些是 Router 墙钟耗时，不是 GPU 计算或首 token 延迟；不改变选路公式。
-
-## P KV 压力试验
-
-在原 JSON 中加入 `"prefill_kv_guard": true` 即可启用；删除该项恢复原计算量选路。它调整选路优先级，不是硬性 KV 准入限流。
-
-- CPU 测试：717 项通过，另 12 项 WASM 示例测试未运行。
-- 模型仍用原 C230 镜像与 FP8/MTP3；不改 Mooncake 的读租约或缓存格式。
-- 基线终结后更换 Router、独立 DB 对照，记录 P/D 抢占、失败及 55% 后完整分钟性能。
