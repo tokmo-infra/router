@@ -7,7 +7,7 @@ Program scheduling is an optional layer before native vLLM Router forwarding. It
 Library users configure Program scheduling through `RouterConfig.program_scheduling`. The standalone Rust and Python CLIs use `--enable-program-scheduling` as the explicit feature switch; `--program-scheduling-config-json` optionally overrides the default configuration and is rejected when the switch is absent. Individual scheduling fields are not exposed as separate CLI flags. The `program_scheduling_enable_key` field controls which requests opt in after the feature is enabled:
 
 | Value | Behavior |
-|---|---|
+| --- | --- |
 | `vllm_xargs.agentic_context` | Default. Only the canonical body object enables Program scheduling. |
 | `auto` | Also accepts `agent_hint`, Claude Code Headers, Codex/OpenCode Headers, and `x-session-id`. |
 
@@ -85,15 +85,15 @@ Identity-free requests do not create Program state, enter RequestPool, or trigge
 All fields below belong to `program_scheduling`. Values omitted from the JSON object use the listed defaults.
 
 | Parameter | Default | Effect on scheduling |
-|---|---:|---|
+| --- | ---: | --- |
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
 | `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, resume first tries the previous Rank and may then select another Rank that passes the cross-Rank capacity gates. |
 | `resume_order` | `mru` | Orders ordinary Rank-local resume candidates within the same force-resume, request-priority, and segment-yield tier. Supported values are `mru` and `fcfs`; cross-Rank resume is always FCFS. |
 | `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
-| `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
+| `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
-| `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
+| `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
 | `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
 | `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its native vLLM waiting-request count reaches this threshold. `0` disables this waiting gate. |
@@ -169,7 +169,7 @@ Acting Programs are not reclaimed by admission or resume. Their TTL and terminal
 The prefill and decode coefficients depend on the model, accelerator, parallel configuration, inference-engine version, and execution settings. Operators should measure them on the deployed backend rather than copying values calibrated for a different system. Follow the [AgentInfer backend calibration procedure](https://github.com/openJiuwen-ai/agent-infer/blob/main/tools/calibration/README.md), retain its fit-quality evidence, and copy the constrained coefficients from `calibration.json` into the Router configuration:
 
 | AgentInfer `calibration.json` coefficient | Router field |
-|---|---|
+| --- | --- |
 | `ttl_prefill_model_intercept_seconds` | `prefill_cost_model.intercept_seconds` |
 | `ttl_prefill_model_linear_seconds_per_1k_tokens` | `prefill_cost_model.linear_seconds_per_1k_tokens` |
 | `ttl_prefill_model_quadratic_seconds_per_1k_tokens_squared` | `prefill_cost_model.quadratic_seconds_per_1k_tokens_squared` |
@@ -184,7 +184,7 @@ The built-in values remain backward-compatible defaults. When Program scheduling
 For `x = uncached_prompt_tokens / 1000`, the cold-prefill estimate is `prefill_seconds = intercept_seconds + linear_seconds_per_1k_tokens * x + quadratic_seconds_per_1k_tokens_squared * x^2`. Progress-TTL includes mixed-batch decode interference as `cache_miss_impact_seconds = prefill_seconds * (2 - decode_throughput_alpha)`.
 
 | `prefill_cost_model` field | Unit | Constraint | Default |
-|---|---|---|---:|
+| --- | --- | --- | ---: |
 | `intercept_seconds` | seconds | finite and >= 0 | `0.06600061907132926` |
 | `linear_seconds_per_1k_tokens` | seconds per 1K uncached tokens | finite and >= 0 | `0.05702024012166613` |
 | `quadratic_seconds_per_1k_tokens_squared` | seconds per squared 1K-token unit | finite and >= 0 | `0.0044057347937978475` |
@@ -193,7 +193,7 @@ For `x = uncached_prompt_tokens / 1000`, the cold-prefill estimate is `prefill_s
 For batch size `B` and the sum of full Program contexts `C`, aggregate decode throughput is `B / (fixed_step_seconds + batch_step_seconds_per_request * B + context_step_seconds_per_token * C)`. Full Program contexts are used even when Programs share prefixes because the fitted surface models execution cost rather than physical KV occupancy.
 
 | `decode_throughput_model` field | Unit | Constraint | Default |
-|---|---|---|---:|
+| --- | --- | --- | ---: |
 | `fixed_step_seconds` | seconds per decode step | finite and > 0 | `0.010635218423115973` |
 | `batch_step_seconds_per_request` | additional step seconds per batched request | finite and >= 0 | `0.0004192803698834784` |
 | `context_step_seconds_per_token` | additional step seconds per total context token | finite and >= 0 | `1.420458414996201e-7` |

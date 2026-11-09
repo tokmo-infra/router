@@ -1,11 +1,16 @@
-# Dockerfile for vllm-router
-FROM rustlang/rust:nightly-bookworm as rust-builder
+# The runtime supplies the listener shim and shared libraries. Import it first.
+ARG ROUTER_RUNTIME_IMAGE=router:vllm-yyf
+ARG RUST_BUILD_IMAGE=rust:1.99.1-bookworm
+FROM ${RUST_BUILD_IMAGE} AS rust-builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    cmake \
+    protobuf-compiler \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -17,15 +22,11 @@ COPY src ./src
 COPY wit ./wit
 
 # Build the Rust binary
-RUN cargo build --release
+ARG CARGO_BUILD_JOBS=4
+RUN cargo build --release --locked -j "$CARGO_BUILD_JOBS"
 
 # Python stage with Rust binary
-FROM python:3.12-slim-bookworm
-
-# Install system dependencies
-RUN apt-get update && apt-get upgrade -y && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM ${ROUTER_RUNTIME_IMAGE}
 
 # Create app directory
 WORKDIR /app
@@ -41,14 +42,7 @@ COPY py_src ./py_src
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install the Python launcher's runtime dependency, then drop pip from the
-# final image: the router does not need pip at runtime, and pip's vendored
-# msgpack/setuptools trip vulnerability scanners (GHSA-6v7p-g79w-8964,
-# CVE-2025-47273, CVE-2026-59890). Removing ensurepip also removes the
-# bundled pip wheel, which carries the same vendored copies.
-RUN pip3 install --no-cache-dir requests \
-    && pip3 uninstall -y pip \
-    && rm -rf /usr/local/lib/python3.12/ensurepip
+RUN test -r /usr/local/lib/router-listener.so
 
 # Expose default router port
 EXPOSE 8080

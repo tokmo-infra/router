@@ -21,8 +21,6 @@ pub enum ProgramBindingStrategy {
     ProgramRoundRobin,
     /// Select the backend with the fewest accounted Programs.
     LeastProgramCount,
-    /// Select the backend with the greatest unaccounted token capacity.
-    ReasoningTokenBalance,
     /// Combine request-text prefix affinity with current KV headroom.
     CacheAware,
 }
@@ -36,7 +34,7 @@ pub struct ProgramBindingCandidate {
     pub accounted_programs: usize,
     /// Private tokens of active Programs plus paused reasoning Programs.
     pub accounted_tokens: f64,
-    /// Explicit per-target token capacity required by token balance.
+    /// Explicit per-target token capacity for admission and headroom checks.
     pub capacity_tokens: Option<usize>,
     /// Current target KV pressure normalized to [0, 1].
     pub kv_pressure: f64,
@@ -81,7 +79,6 @@ impl ProgramBindings {
             }
             ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
             ProgramBindingStrategy::LeastProgramCount => Box::new(LeastProgramCountBinding),
-            ProgramBindingStrategy::ReasoningTokenBalance => Box::new(ReasoningTokenBalanceBinding),
             ProgramBindingStrategy::CacheAware => Box::new(CacheAwareBinding::default()),
         };
         Self {
@@ -275,34 +272,6 @@ impl ProgramBindingPolicy for LeastProgramCountBinding {
     }
 }
 
-#[derive(Debug)]
-struct ReasoningTokenBalanceBinding;
-
-impl ProgramBindingPolicy for ReasoningTokenBalanceBinding {
-    fn select(
-        &mut self,
-        _identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        _routing_text: Option<&str>,
-    ) -> Option<String> {
-        candidates
-            .iter()
-            .map(|candidate| {
-                let capacity = candidate
-                    .capacity_tokens
-                    .expect("reasoning-token balance requires explicit capacity")
-                    as f64;
-                (candidate, capacity - candidate.accounted_tokens)
-            })
-            .max_by(|(left, left_remaining), (right, right_remaining)| {
-                left_remaining
-                    .total_cmp(right_remaining)
-                    .then_with(|| right.target_id.cmp(&left.target_id))
-            })
-            .map(|(candidate, _)| candidate.target_id.clone())
-    }
-}
-
 #[derive(Debug, Default)]
 struct CacheAwareBinding {
     affinity: CacheAwarePolicy,
@@ -352,6 +321,22 @@ impl ProgramBindingPolicy for CacheAwareBinding {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn removed_capacity_strategy_is_rejected() {
+        assert!(
+            serde_json::from_value::<ProgramBindingStrategy>(json!("reasoning_token_balance"))
+                .is_err()
+        );
+        for value in [
+            "consistent_hash",
+            "program_round_robin",
+            "least_program_count",
+            "cache_aware",
+        ] {
+            assert!(serde_json::from_value::<ProgramBindingStrategy>(json!(value)).is_ok());
+        }
+    }
 
     fn identity(program_id: &str) -> ProgramIdentity {
         ProgramIdentity::from_request(
@@ -434,21 +419,6 @@ mod tests {
             candidate("rank-2", 1, 30.0, 100),
             candidate("rank-1", 1, 90.0, 100),
             candidate("rank-0", 2, 10.0, 100),
-        ];
-        assert_eq!(
-            bindings
-                .bind(&identity("program-a"), &candidates, None)
-                .as_deref(),
-            Some("rank-1")
-        );
-    }
-
-    #[test]
-    fn token_balance_chooses_most_remaining_capacity() {
-        let mut bindings = ProgramBindings::new(ProgramBindingStrategy::ReasoningTokenBalance, 160);
-        let candidates = vec![
-            candidate("rank-0", 1, 80.0, 100),
-            candidate("rank-1", 4, 20.0, 100),
         ];
         assert_eq!(
             bindings
