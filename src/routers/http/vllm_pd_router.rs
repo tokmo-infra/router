@@ -680,6 +680,17 @@ impl VllmPDRouter {
         self.pd_router.stop_profiling(worker_url).await;
     }
 
+    // The Responses API has no min_tokens field. Its P copy still must ignore
+    // EOS and caller stop rules so Mooncake can publish length-capped KV.
+    fn apply_prefill_length_cap(request: &mut Value, path: &str) {
+        if path != "/v1/responses" {
+            request["min_tokens"] = json!(1);
+        }
+        request["ignore_eos"] = json!(true);
+        request["stop"] = Value::Null;
+        request["stop_token_ids"] = json!([]);
+    }
+
     /// Modify request for prefill stage (limit output to 1 token)
     /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
     /// - For /v1/responses: patch max_output_tokens (the only token-limit field for Responses API)
@@ -726,13 +737,10 @@ impl VllmPDRouter {
         // Mooncake publishes producer-ready KV only for length-capped P
         // requests. An EOS/stop here must not strand the subsequent D pull.
         // Apply this only to the P copy; decode keeps the caller's policy.
-        if matches!(path, "/v1/chat/completions" | "/v1/completions")
+        if matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/responses")
             && std::env::var("VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP").as_deref() == Ok("1")
         {
-            request["min_tokens"] = json!(1);
-            request["ignore_eos"] = json!(true);
-            request["stop"] = Value::Null;
-            request["stop_token_ids"] = json!([]);
+            Self::apply_prefill_length_cap(&mut request, path);
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
@@ -3066,6 +3074,28 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn responses_prefill_length_cap_preserves_decode_request() {
+        let original = json!({"max_output_tokens":128,"ignore_eos":false,
+            "stop":["OK"],"stop_token_ids":[1]});
+        let decode = original.clone();
+        let mut prefill = original.clone();
+        VllmPDRouter::apply_prefill_length_cap(&mut prefill, "/v1/responses");
+        assert_eq!(prefill["ignore_eos"], true);
+        assert!(prefill["stop"].is_null());
+        assert_eq!(prefill["stop_token_ids"], json!([]));
+        assert!(prefill.get("min_tokens").is_none());
+        assert_eq!(decode, original);
+    }
+
+    #[test]
+    fn chat_prefill_length_cap_still_sets_min_tokens() {
+        let mut prefill = json!({});
+        VllmPDRouter::apply_prefill_length_cap(&mut prefill, "/v1/chat/completions");
+        assert_eq!(prefill["min_tokens"], 1);
+        assert_eq!(prefill["ignore_eos"], true);
     }
 
     // --- Responses API endpoint tests (/v1/responses) ---
