@@ -4,6 +4,7 @@ use super::dp_utils;
 use super::token_balance::{TokenBalancer, Reservation as TokenReservation};
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
+use super::response_history::ResponseHistory;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
@@ -45,6 +46,7 @@ struct MooncakePrefillInfo {
 pub struct VllmPDRouter {
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    response_history: Option<Arc<ResponseHistory>>,
     // Shared by all direct routes; never held across an await.
     decode_admission: parking_lot::Mutex<()>,
     token_balancer: Option<Arc<TokenBalancer>>,
@@ -374,6 +376,19 @@ impl VllmPDRouter {
     ) -> Option<Value> {
         match self.kv_connector {
             KvConnector::Mooncake => {
+                // Native Messages cannot force ignore_eos. Mooncake publishes
+                // KV only on a length cap. On an early stop D must prefill locally.
+                if let Some(reply) =
+                    prefill_response_json.filter(|reply| reply["type"] == "message")
+                {
+                    match reply["stop_reason"].as_str() {
+                        Some("max_tokens") => {}
+                        Some("end_turn" | "stop_sequence" | "tool_use") => {
+                            return Some(Value::Null)
+                        }
+                        _ => return None,
+                    }
+                }
                 let Some((bootstrap_addr, engine_id)) = self
                     .get_mooncake_info(prefill_url, prefill_dp_rank.map(|r| r as usize))
                 else {
@@ -680,6 +695,17 @@ impl VllmPDRouter {
         self.pd_router.stop_profiling(worker_url).await;
     }
 
+    // The Responses API has no min_tokens field. Its P copy still must ignore
+    // EOS and caller stop rules so Mooncake can publish length-capped KV.
+    fn apply_prefill_length_cap(request: &mut Value, path: &str) {
+        if path != "/v1/responses" {
+            request["min_tokens"] = json!(1);
+        }
+        request["ignore_eos"] = json!(true);
+        request["stop"] = Value::Null;
+        request["stop_token_ids"] = json!([]);
+    }
+
     /// Modify request for prefill stage (limit output to 1 token)
     /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
     /// - For /v1/responses: patch max_output_tokens (the only token-limit field for Responses API)
@@ -726,13 +752,14 @@ impl VllmPDRouter {
         // Mooncake publishes producer-ready KV only for length-capped P
         // requests. An EOS/stop here must not strand the subsequent D pull.
         // Apply this only to the P copy; decode keeps the caller's policy.
-        if matches!(path, "/v1/chat/completions" | "/v1/completions")
+        if matches!(path, "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/messages")
             && std::env::var("VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP").as_deref() == Ok("1")
         {
-            request["min_tokens"] = json!(1);
-            request["ignore_eos"] = json!(true);
-            request["stop"] = Value::Null;
-            request["stop_token_ids"] = json!([]);
+            if path == "/v1/messages" {
+                request.as_object_mut().unwrap().remove("stop_sequences");
+            } else {
+                Self::apply_prefill_length_cap(&mut request, path);
+            }
         }
         // Force non-streaming for prefill to get JSON response with kv_transfer_params
         request["stream"] = json!(false);
@@ -1151,6 +1178,9 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
+                if path == "/v1/responses" && prefill_status.is_client_error() {
+                    return Ok(Self::forward_upstream_response(prefill_response));
+                }
                 let error_body = prefill_response.text().await.unwrap_or_default();
                 return Err(format!(
                     "Prefill server error {}: {}",
@@ -1203,10 +1233,7 @@ impl VllmPDRouter {
             );
         } else if Self::reuse_prefill_prompt_ids(path) {
             return Err("Missing prefill KV metadata for token-ID reuse".into());
-        }
-
-        if matches!(self.kv_connector, KvConnector::Mooncake)
-            && decode_request.pointer("/kv_transfer_params/remote_prefill_cached_tokens").is_none() {
+        } else if matches!(self.kv_connector, KvConnector::Mooncake) {
             return Err("Mooncake PD missing verified P cache usage or bootstrap metadata".into());
         }
         let decode_request_str = serde_json::to_string(&decode_request)
@@ -1307,15 +1334,7 @@ impl VllmPDRouter {
                             }
                         }
                     }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        warn!("Concurrent prefill returned non-2xx status: {}", status);
-                        Err(format!("Prefill request failed with status {}", status))
-                    }
-                    Err(e) => {
-                        warn!("Concurrent prefill request failed: {}", e);
-                        Err(format!("Prefill request failed: {}", e))
-                    }
+                    failure => Err(failure),
                 }
             };
             let decode_fut = otel_http::send_client_request(
@@ -1330,7 +1349,7 @@ impl VllmPDRouter {
             );
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
             let concurrent_prefill_response_json: Option<Value> = match prefill_result {
-                Err(prefill_err) => {
+                Err(failure) => {
                     self.stop_profiling(&format!("http://{}", decode_base_http))
                         .await;
                     let duration = start_time.elapsed();
@@ -1338,6 +1357,13 @@ impl VllmPDRouter {
                     RouterMetrics::record_pd_request(path);
                     RouterMetrics::record_pd_request_duration(path, duration);
                     RouterMetrics::record_pd_prefill_request(prefill_http);
+                    let prefill_err = match failure {
+                        Ok(resp) if path == "/v1/responses" && resp.status().is_client_error() => {
+                            return Ok(Self::forward_upstream_response(resp));
+                        }
+                        Ok(resp) => format!("Prefill request failed with status {}", resp.status()),
+                        Err(error) => format!("Prefill request failed: {error}"),
+                    };
                     return Err(format!(
                         "Prefill request failed to {}: {}",
                         prefill_http, prefill_err
@@ -1580,6 +1606,13 @@ impl VllmPDRouter {
         );
 
         let prefill_status = prefill_response.status();
+        if path == "/v1/responses" && prefill_status.is_client_error() {
+            self.stop_profiling(&prefill_base_url).await;
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            return Ok(Self::forward_upstream_response(prefill_response));
+        }
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1960,6 +1993,9 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                if path == "/v1/responses" && resp.status().is_client_error() {
+                    return Ok(Self::forward_upstream_response(resp));
+                }
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",
@@ -2046,6 +2082,9 @@ impl VllmPDRouter {
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         let kv_connector = ctx.router_config.kv_connector;
+        let response_history = (matches!(kv_connector, KvConnector::Mooncake)
+            && ctx.router_config.history_backend == crate::config::HistoryBackend::Memory)
+            .then(|| Arc::new(ResponseHistory::default()));
         let http_client = reqwest::Client::new();
 
         if let Some(ref addr) = discovery_address {
@@ -2074,6 +2113,7 @@ impl VllmPDRouter {
 
             Ok(Self {
                 pd_router,
+                response_history,
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2171,6 +2211,7 @@ impl VllmPDRouter {
 
             Ok(Self {
                 pd_router,
+                response_history,
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2707,9 +2748,89 @@ impl RouterTrait for VllmPDRouter {
             method, path
         );
 
-        // Body is already a serde_json::Value, use it directly
-        let request_json = body;
+        if path == "/v1/messages/count_tokens" {
+            return self.count_message_tokens(headers, body).await;
+        }
+        let mut request_json = body;
+        let turn = match (path, &self.response_history) {
+            ("/v1/responses", Some(history)) => match history.prepare(headers, &mut request_json) {
+                Ok(turn) => turn,
+                Err(error) => return error.into_response(),
+            },
+            _ => None,
+        };
+        let response = self.forward_pd(headers, path, request_json).await;
+        match turn {
+            Some(turn) => turn.finish(response).await,
+            None => response,
+        }
+    }
+}
 
+impl VllmPDRouter {
+    async fn count_message_tokens(&self, headers: Option<&HeaderMap>, body: Value) -> Response {
+        let path = "/v1/messages/count_tokens";
+        let workers = if self.use_discovery {
+            Self::instances_to_workers(&self.service_registry.get_prefill_instances())
+        } else {
+            self.pd_router
+                .worker_registry
+                .get_prefill_workers()
+                .into_iter()
+                .filter(|worker| worker.is_available())
+                .collect()
+        };
+        let policy = self.policy_registry.get_prefill_policy();
+        let text = body.to_string();
+        let Some(worker) = policy
+            .select_worker(&workers, Some(&text))
+            .and_then(|i| workers.get(i))
+        else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No available prefill worker",
+            )
+                .into_response();
+        };
+        let url = worker.endpoint_url(path);
+        let request = self
+            .pd_router
+            .client
+            .post(&url)
+            .bearer_auth(std::env::var("OPENAI_API_KEY").unwrap_or_default());
+        let request = dp_utils::add_dp_rank_header(request, worker.dp_rank());
+        let request = request
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(text);
+        match otel_http::send_client_request(
+            request,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &url,
+                route: Some(path),
+                request_phase: Some("prefill"),
+            },
+        )
+        .await
+        {
+            Ok(upstream) => Self::forward_upstream_response(upstream),
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        }
+    }
+
+    fn forward_upstream_response(upstream: reqwest::Response) -> Response {
+        let status = upstream.status();
+        let headers = header_utils::preserve_response_headers(upstream.headers());
+        (status, headers, Body::from_stream(upstream.bytes_stream())).into_response()
+    }
+
+    async fn forward_pd(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        request_json: Value,
+    ) -> Response {
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
             self.process_vllm_request(request_json, path, headers).await
@@ -3066,6 +3187,28 @@ mod tests {
         let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn responses_prefill_length_cap_preserves_decode_request() {
+        let original = json!({"max_output_tokens":128,"ignore_eos":false,
+            "stop":["OK"],"stop_token_ids":[1]});
+        let decode = original.clone();
+        let mut prefill = original.clone();
+        VllmPDRouter::apply_prefill_length_cap(&mut prefill, "/v1/responses");
+        assert_eq!(prefill["ignore_eos"], true);
+        assert!(prefill["stop"].is_null());
+        assert_eq!(prefill["stop_token_ids"], json!([]));
+        assert!(prefill.get("min_tokens").is_none());
+        assert_eq!(decode, original);
+    }
+
+    #[test]
+    fn chat_prefill_length_cap_still_sets_min_tokens() {
+        let mut prefill = json!({});
+        VllmPDRouter::apply_prefill_length_cap(&mut prefill, "/v1/chat/completions");
+        assert_eq!(prefill["min_tokens"], 1);
+        assert_eq!(prefill["ignore_eos"], true);
     }
 
     // --- Responses API endpoint tests (/v1/responses) ---

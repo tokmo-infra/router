@@ -306,10 +306,17 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
+    }
+    if let Err((param, message)) = crate::protocols::responses_compat::normalize(&mut body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"type": "invalid_request_error", "param": param, "message": message}})),
+        )
+            .into_response();
     }
 
     state
