@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -47,6 +47,14 @@ pub struct PrefixMatchResult {
     /// Number of characters matched
     pub matched_char_count: usize,
     /// Total number of characters in the input text
+    pub input_char_count: usize,
+}
+
+/// All owners of the longest matched prefix, collected in one tree traversal.
+#[derive(Debug, Clone)]
+pub struct PrefixMatchCandidates {
+    pub tenants: Vec<TenantId>,
+    pub matched_char_count: usize,
     pub input_char_count: usize,
 }
 
@@ -526,9 +534,8 @@ impl Tree {
             .insert(Arc::clone(&tenant_id), epoch);
     }
 
-    /// Performs prefix matching and returns detailed result with char counts.
-    /// Optimized: no string allocations, deferred char counting.
-    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+    /// Shared longest-prefix traversal; never rescans the input per worker.
+    fn longest_prefix_node(&self, text: &str, allowed: Option<&HashSet<&str>>) -> (NodeRef, usize) {
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
@@ -539,6 +546,16 @@ impl Tree {
             let child_node = prev.children.get(&first_char).map(|e| e.value().clone());
 
             if let Some(matched_node) = child_node {
+                // If no eligible owner reaches this edge, keep the deepest
+                // eligible ancestor instead of discarding healthy cache hits.
+                if allowed.is_some_and(|owners| {
+                    !matched_node
+                        .tenant_last_access_time
+                        .iter()
+                        .any(|entry| owners.contains(entry.key().as_ref()))
+                }) {
+                    break;
+                }
                 let matched_text_guard = matched_node.text.read().unwrap();
                 let matched_node_text_count = matched_text_guard.char_count();
 
@@ -563,7 +580,34 @@ impl Tree {
             }
         }
 
-        let curr = prev;
+        (prev, matched_chars)
+    }
+
+    /// Return every equally good cache owner for load-aware tie breaking.
+    pub fn prefix_match_candidates(
+        &self,
+        text: &str,
+        eligible_tenants: &[&str],
+    ) -> PrefixMatchCandidates {
+        let allowed: HashSet<&str> = eligible_tenants.iter().copied().collect();
+        let (node, matched_char_count) = self.longest_prefix_node(text, Some(&allowed));
+        let tenants = node
+            .tenant_last_access_time
+            .iter()
+            .filter(|entry| allowed.contains(entry.key().as_ref()))
+            .map(|entry| Arc::clone(entry.key()))
+            .collect();
+        PrefixMatchCandidates {
+            tenants,
+            matched_char_count,
+            input_char_count: text.chars().count(),
+        }
+    }
+
+    /// Performs prefix matching and returns detailed result with char counts.
+    /// Optimized: no string allocations, deferred char counting.
+    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+        let (curr, matched_chars) = self.longest_prefix_node(text, None);
 
         // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
         // The cache is valid if the tenant still exists in tenant_last_access_time.
@@ -2308,5 +2352,27 @@ mod tests {
             assert_eq!(matched, *text, "Failed for: {:?}", text);
             assert_eq!(matched_tenant, *tenant);
         }
+    }
+    #[test]
+    fn test_prefix_candidates_share_longest_match_and_remove_stale_owner() {
+        let tree = Tree::new();
+        for tenant in ["a", "b", "c"] {
+            tree.insert("共同长前缀 abc", tenant);
+        }
+        tree.insert("共同", "short");
+        let result = tree.prefix_match_candidates("共同长前缀 abd", &["a", "b", "c", "short"]);
+        let mut tenants: Vec<&str> = result.tenants.iter().map(|t| t.as_ref()).collect();
+        tenants.sort();
+        assert_eq!(tenants, ["a", "b", "c"]);
+        let legacy = tree.prefix_match_with_counts("共同长前缀 abd");
+        assert_eq!(result.matched_char_count, legacy.matched_char_count);
+        assert_eq!(result.input_char_count, legacy.input_char_count);
+        tree.remove_tenant("b");
+        let result = tree.prefix_match_candidates("共同长前缀 abc", &["a", "b", "c"]);
+        assert_eq!(result.tenants.len(), 2);
+        assert!(!result.tenants.iter().any(|t| t.as_ref() == "b"));
+        let empty = Tree::new().prefix_match_candidates("", &[]);
+        assert!(empty.tenants.is_empty());
+        assert_eq!(empty.input_char_count, 0);
     }
 }

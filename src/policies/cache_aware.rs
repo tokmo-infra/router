@@ -11,7 +11,7 @@
     - Uses cache-aware routing when the system is balanced
 
     A system is considered imbalanced if both conditions are met:
-    1. (max - min) > abs_threshold
+    1. (max - min) > min(abs_threshold, mean_healthy_load)
     2. max > rel_threshold * min
 
     Strategy Details:
@@ -43,8 +43,8 @@
     Below this threshold, routes to worker with most available cache space.
 
     2. balance_abs_threshold: (integer)
-    Absolute difference threshold for load imbalance detection.
-    System is potentially imbalanced if (max_load - min_load) > abs_threshold
+    Absolute difference cap for load imbalance detection.
+    At low concurrency the threshold scales down to mean healthy-worker demand.
 
     3. balance_rel_threshold: (float)
     Relative ratio threshold for load imbalance detection.
@@ -65,7 +65,6 @@ use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
 use crate::tree::Tree;
 use dashmap::DashMap;
-use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -241,6 +240,31 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Rank demand first, then instance demand so idle ranks on a busy HTTP
+    /// instance do not steal the entire next low-concurrency burst.
+    fn least_busy(workers: &[Arc<dyn Worker>], indices: &[usize]) -> Option<usize> {
+        let mut instances: HashMap<&str, (usize, usize)> = HashMap::new();
+        for idx in get_healthy_worker_indices(workers) {
+            let worker = &workers[idx];
+            let totals = instances.entry(worker.base_url()).or_default();
+            totals.0 = totals.0.saturating_add(worker.load());
+            totals.1 = totals.1.saturating_add(worker.processed_requests());
+        }
+        indices.iter().copied().min_by_key(|&idx| {
+            let worker = &workers[idx];
+            let (instance_load, instance_processed) = instances[worker.base_url()];
+            (
+                worker.load(),
+                instance_load,
+                instance_processed,
+                worker.processed_requests(),
+                worker.dp_rank().unwrap_or(0),
+                worker.base_url(),
+                worker.url(),
+            )
+        })
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -264,10 +288,7 @@ impl CacheAwarePolicy {
         RouterMetrics::set_load_range(max_load, min_load);
 
         // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        let min_load_idx = Self::least_busy(workers, healthy_indices)?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -319,15 +340,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+        // Unavailable workers must not skew the balancing threshold. At low
+        // concurrency, a fixed CLI threshold of 64 never notices a busy peer.
+        // Scale it down to the healthy pool's mean demand; keep it as a cap.
+        let (min_load, max_load, total_load) =
+            healthy_indices
+                .iter()
+                .fold((usize::MAX, 0usize, 0usize), |(min, max, total), &idx| {
+                    let load = workers[idx].load();
+                    (min.min(load), max.max(load), total.saturating_add(load))
+                });
+        let effective_abs = self
+            .config
+            .balance_abs_threshold
+            .min(total_load / healthy_indices.len());
+        let is_imbalanced = max_load.saturating_sub(min_load) > effective_abs
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         debug!(
@@ -357,15 +384,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         debug!("Available tree keys: {:?}", keys);
 
         let Some(tree) = tree else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
-            // Return a random healthy worker
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            let selected_idx = healthy_indices[random_idx];
+            let selected_idx = Self::least_busy(workers, &healthy_indices)?;
 
             workers[selected_idx].increment_processed();
             RouterMetrics::record_processed_request(workers[selected_idx].url());
@@ -375,8 +394,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         };
         debug!("Using cache-aware routing for model '{}'", model_id);
         // Now we work with the tree without holding the HashMap lock
-        // Use prefix_match_with_counts to avoid redundant chars().count() calls
-        let result = tree.prefix_match_with_counts(text);
+        // Match the deepest eligible prefix once, not once per worker.
+        let eligible_urls: Vec<&str> = healthy_indices
+            .iter()
+            .map(|&idx| workers[idx].url())
+            .collect();
+        let result = tree.prefix_match_candidates(text, &eligible_urls);
         let match_rate = if result.input_char_count == 0 {
             0.0
         } else {
@@ -387,21 +410,24 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
             model_id, result.matched_char_count, result.input_char_count, match_rate
         );
-        // Select worker without String allocation
-        let selected_idx = if match_rate > self.config.cache_threshold {
-            // Cache hit path: find worker by URL (compare &str directly, no allocation)
-            let tenant_url: &str = &result.tenant;
-            workers
-                .iter()
-                .position(|w| w.url() == tenant_url)
-                .filter(|&idx| workers[idx].is_healthy())
-        } else {
-            // Low cache match: use worker with minimum load
+        // Equal-prefix owners are equally useful: prefer the least busy one
+        // instead of pinning all requests to the radix node's cached tenant.
+        let matching: Vec<usize> = if match_rate > self.config.cache_threshold {
             healthy_indices
                 .iter()
-                .min_by_key(|&&idx| workers[idx].load())
                 .copied()
+                .filter(|&idx| {
+                    result
+                        .tenants
+                        .iter()
+                        .any(|tenant| tenant.as_ref() == workers[idx].url())
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
+        let selected_idx = Self::least_busy(workers, &matching)
+            .or_else(|| Self::least_busy(workers, &healthy_indices));
 
         if let Some(idx) = selected_idx {
             // Update the tree with this request (use worker URL directly, no allocation)
@@ -415,23 +441,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return Some(idx);
         }
 
-        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-        if match_rate > self.config.cache_threshold {
-            let tenant_url: &str = &result.tenant;
-            tree.remove_tenant(tenant_url);
-            debug!("Removed stale worker {} from cache tree", tenant_url);
-        }
-
-        // Fallback to first healthy worker
-        if let Some(idx) = healthy_indices.first().copied() {
-            workers[idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
-
-            Some(idx)
-        } else {
-            None
-        }
+        None
     }
 
     fn name(&self) -> &'static str {
@@ -693,5 +703,132 @@ mod tests {
                 .target_id,
             "rank-0"
         );
+    }
+    fn cli_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_cache_aware_equal_prefix_rotates_without_repeated_text_scans() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let text = "真实SWE共同长前缀".repeat(20_000);
+        for worker in &workers {
+            policy.commit_placement("default", &text, worker.url());
+        }
+        let mut counts = [0usize; 4];
+        for _ in 0..32 {
+            let idx = policy.select_worker(&workers, Some(&text)).unwrap();
+            counts[idx] += 1;
+        }
+        assert_eq!(counts, [8; 4]);
+    }
+
+    #[test]
+    fn test_cache_aware_low_concurrency_overrides_busy_affinity() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        policy.init_workers(&workers);
+        policy.commit_placement("default", "shared prompt", workers[0].url());
+        workers[0].increment_load();
+        workers[2].set_healthy(false);
+        // Healthy mean is zero: the idle healthy peer wins over busy cache affinity.
+        assert_eq!(
+            policy.select_worker(&workers, Some("shared prompt")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_cache_aware_unavailable_load_does_not_break_healthy_affinity() {
+        for circuit_open in [false, true] {
+            let policy = cli_policy();
+            let workers: Vec<Arc<dyn Worker>> = (0..3)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://w{i}:8000"),
+                        WorkerType::Regular,
+                    )) as _
+                })
+                .collect();
+            policy.init_workers(&workers);
+            policy.commit_placement("default", "shared prompt", workers[1].url());
+            for worker in &workers[..2] {
+                for _ in 0..8 {
+                    worker.increment_load();
+                }
+            }
+            for _ in 0..1000 {
+                workers[2].increment_load();
+            }
+            if circuit_open {
+                workers[2].circuit_breaker().force_open();
+            } else {
+                workers[2].set_healthy(false);
+            }
+            assert_eq!(
+                policy.select_worker(&workers, Some("shared prompt")),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_uses_shorter_healthy_prefix_when_deepest_owner_unavailable() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        policy.init_workers(&workers);
+        policy.commit_placement("default", "shared prefix long suffix", workers[0].url());
+        policy.commit_placement("default", "shared prefix ", workers[1].url());
+        workers[0].set_healthy(false);
+        assert_eq!(
+            policy.select_worker(&workers, Some("shared prefix long suffix")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_cache_aware_missing_tree_uses_fair_load_fallback() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        let mut counts = [0usize; 4];
+        for _ in 0..32 {
+            counts[policy.select_worker(&workers, None).unwrap()] += 1;
+        }
+        assert_eq!(counts, [8; 4]);
     }
 }

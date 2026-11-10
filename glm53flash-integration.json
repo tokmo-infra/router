@@ -4,8 +4,8 @@
   "repository": "https://github.com/tokmo-infra/router",
   "branch": "glm5.3-flash-1103",
   "image_tag": "router:glm53flash-1103",
-  "image_id": "sha256:300f9f516715d417592e050068d525dd6dc216df1f8934ae8db041e5c3611810",
-  "binary_sha256": "2dd7fd1614df198e3453e7a2b0f451b6409a88dc8aa24188d3e582d85cf35387",
+  "image_id": "sha256:eb9567c4b1735c56a11d803fe716573c3dfcd1e5ff8c3c01281547c2d39c576d",
+  "binary_sha256": "7eaceb8c4bc0c0be4e02ba7e8b9fa88b306cea3bf81fb91fb5836132e79d8af4",
   "listener_sha256": "1470f99b88635edb0ffa0d2f9ac0644b3e6679273fa57f2ee12011a38f392139",
   "build": {
     "rust_image": "rust:1.99.1-bookworm",
@@ -15,7 +15,7 @@
     "vllm_rust_commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
     "locked": true
   },
-  "source_tree_sha256": "12b8b07bad5333671a9e0ba8ebe2e1edc519f95b51a822e7740dff01eb3234e1",
+  "source_tree_sha256": "7aebf9c6226dbb3c8b8fa3b46d7a8c824bcbf4a221d44e45e9200a1d2262e16f",
   "source_tree_digest_format": "Sorted src/**/*.rs, Cargo.toml and Cargo.lock; each relative path + NUL + file SHA256; LF-separated UTF-8 lines, no trailing LF.",
   "source_files": [
     {
@@ -48,7 +48,7 @@
     },
     {
       "path": "src/routers/http/vllm_pd_router.rs",
-      "sha256": "22cb7f5e905fe3305f73ce167d7af0f4c3b0a7499d80586586432d3b37f6be15"
+      "sha256": "96b68ed96ba1d627d1b869d4b150b4e228be1cf066701243566d01a638907c72"
     },
     {
       "path": "src/program_scheduling/binding/mod.rs",
@@ -60,27 +60,60 @@
     },
     {
       "path": "src/policies/cache_aware.rs",
-      "sha256": "18ba044ae252eb3a0baa24021073ffa2bb88aac2efb4072c06f16580e09791a6"
+      "sha256": "0ed48f956d528736ecd31bc091e0b3b05195b4ba7a3625f4b26e5ff30dfd7aa0"
     },
     {
       "path": "src/tree.rs",
-      "sha256": "c4492241e39113cb550d8ac5b76d3c2698333dc95edf0fc9d9bde3cce0f02697"
+      "sha256": "62d16a013c18a3b21356833854ce073808061d0897773548e77541c01f78d5e0"
+    },
+    {
+      "path": "src/policies/round_robin.rs",
+      "sha256": "6eef36b5a8e06f22699ca707d46c38187270acab6dc13bf270533bda5045bb13"
+    },
+    {
+      "path": "tests/pd_low_concurrency_regression.py",
+      "sha256": "6f235034b509ab27634a64ae414438b19cc970a658af162cbbb8bf099e03c156"
     }
   ],
   "validation": {
     "linux_release_build": "passed",
     "linux_library_tests": {
       "command": "cargo test --release --locked --lib",
-      "passed": 725,
+      "passed": 739,
       "failed": 0,
       "ignored": 0
     },
     "prompt_id_handoff": "passed; malformed IDs rejected before decode",
     "mooncake_handoff": "passed; 16 requests, concurrency 8, 131072 token IDs; CPU fake backends only",
-    "removed_config": "absent from new binary; obsolete environment ignored during both contract tests",
+    "removed_config": "No TokenBalance policies, estimator tokenizer or token-slot allocation in the branch.",
     "bash_blocks": 25,
     "offline_model_commands": 20,
-    "offline_router_commands": 5
+    "offline_router_commands": 5,
+    "low_concurrency_distribution": {
+      "scope": "CPU fake Mooncake 8xEP4 P and 4xEP8 D; routing contract, not GPU performance",
+      "concurrencies": [
+        8,
+        16,
+        32
+      ],
+      "consecutive_waves": 3,
+      "requests_per_physical_host": [
+        2,
+        4,
+        8
+      ],
+      "requests_per_prefill_instance": [
+        1,
+        2,
+        4
+      ],
+      "unique_prefill_and_decode_ranks_per_wave": [
+        8,
+        16,
+        32
+      ],
+      "checks": "healthy pools, reordering, equal-prefix ties, idle instance/rank fairness, cancellation-safe reservations"
+    }
   },
   "deployments": {
     "router": "https://github.com/tokmo-infra/router/blob/glm5.3-flash-1103/DEPLOYMENT.md",

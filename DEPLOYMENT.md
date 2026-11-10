@@ -11,6 +11,7 @@ P使用 `cache_aware`，D使用 `round_robin`。同一套Router命令支持1P2D�
 | `--prefill-policy` / `--decode-policy` | `cache_aware` / `round_robin` | P按前缀缓存选择；D在健康worker之间轮询，不经过估算token容量策略。 |
 | `VLLM_ROUTER_PD_REUSE_PROMPT_IDS` | 1 | 将P返回的精确token IDs交给D，长输入不重复分词；两端tokenizer与chat template一致。 |
 | `VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP` | 1 | P的单token请求忽略EOS/stop以发布Mooncake KV；D保留客户端的输出长度和停止条件。 |
+| `--balance-abs-threshold` / `--balance-rel-threshold` | 64 / 1.5 | P纠偏阈值。绝对阈值按健康worker平均在途数向下缩放，低并发也能避开忙碌rank；同等缓存命中优先空闲、累计请求较少的worker。一般保留默认值。 |
 | `--max-tree-size` | 2147483648 | 每worker/tenant前缀树保留字符预算，不是进程RAM字节数；需要较小缓存时降低该值。 |
 | `--eviction-interval` | 120秒 | 后台LRU清理周期；希望更快回收旧前缀时缩短。 |
 | `--max-concurrent-requests` | 4096 | Router总在途请求上限，不是分词槽位；测试并发由客户端设置。 |
@@ -124,4 +125,4 @@ curl -fsS -H "Authorization: Bearer $API_KEY" \
     '.total == $n and (.workers | length == $n) and all(.workers[]; .is_healthy == true)'
 ~~~
 
-1P2D应有24个健康rank，4P4D应有64个。核对D轮询、复用和length-cap开关、无CPU quota及内存限制。P/D的MTP、异步调度、图和缓存由引擎部署命令核验。
+1P2D应有24个健康rank，4P4D应有64个。D按rank先后交错各实例，低并发也会轮到多台机器；C8等并发小于总rank数时，后续请求继续轮询其余rank。核对D轮询、复用和length-cap开关、无CPU quota及内存限制。P/D的MTP、异步调度、图和缓存由引擎部署命令核验。

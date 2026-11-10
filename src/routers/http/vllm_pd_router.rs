@@ -46,6 +46,7 @@ pub struct VllmPDRouter {
     pd_router: PdRouterBase,
     // Shared by all direct routes; never held across an await.
     decode_admission: parking_lot::Mutex<()>,
+    prefill_admission: parking_lot::Mutex<()>,
     /// Service discovery registry for dynamic ZMQ address resolution
     service_registry: Arc<ServiceRegistry>,
     /// HTTP client for making requests to discovered services
@@ -86,7 +87,7 @@ impl Drop for OwnedLoadReservation {
     fn drop(&mut self) { self.0.decrement_load(); }
 }
 
-fn select_and_reserve_decode(
+fn select_and_reserve_worker(
     admission: &parking_lot::Mutex<()>,
     policy: &dyn LoadBalancingPolicy,
     workers: &[Arc<dyn Worker>],
@@ -180,10 +181,16 @@ impl VllmPDRouter {
     fn select_direct_pair(
         &self, ps: &[Arc<dyn Worker>], ds: &[Arc<dyn Worker>],
         text: Option<&str>, headers: Option<&RequestHeaders>,
-    ) -> Result<(usize, usize, OwnedLoadReservation), String> {
-        let p = self.policy_registry.get_prefill_policy().select_worker_with_headers(ps,text,headers).ok_or("no prefill workers")?;
-        let (d,r) = select_and_reserve_decode(&self.decode_admission,self.policy_registry.get_decode_policy().as_ref(),ds,text,headers).ok_or("no decode workers")?;
-        Ok((p,d,r))
+    ) -> Result<(usize, usize, OwnedLoadReservation, OwnedLoadReservation), String> {
+        // Reserve at selection, before serialization or any network await. This
+        // makes the next arrival see assigned P demand even during a burst.
+        let (p, pr) = select_and_reserve_worker(&self.prefill_admission,
+            self.policy_registry.get_prefill_policy().as_ref(), ps, text, headers)
+            .ok_or("no prefill workers")?;
+        let (d, dr) = select_and_reserve_worker(&self.decode_admission,
+            self.policy_registry.get_decode_policy().as_ref(), ds, text, headers)
+            .ok_or("no decode workers")?;
+        Ok((p, d, pr, dr))
     }
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
@@ -1425,6 +1432,7 @@ impl VllmPDRouter {
         original_request: Value,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        prefill_reservation: OwnedLoadReservation,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
@@ -1441,6 +1449,7 @@ impl VllmPDRouter {
                     decode_request,
                     prefill_worker,
                     decode_worker,
+                    prefill_reservation,
                     request_id,
                     path,
                     headers,
@@ -1455,9 +1464,6 @@ impl VllmPDRouter {
             decode_worker.url(),
             path
         );
-
-        // Increment prefill load at the start of the prefill phase
-        let prefill_reservation = OwnedLoadReservation::new(prefill_worker.clone());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1881,6 +1887,7 @@ impl VllmPDRouter {
         decode_request: Value,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        prefill_reservation: OwnedLoadReservation,
         request_id: String,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -1908,7 +1915,6 @@ impl VllmPDRouter {
             )
         };
 
-        let prefill_reservation = OwnedLoadReservation::new(prefill_worker.clone());
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -2076,6 +2082,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info: HashMap::new(),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 decode_admission: parking_lot::Mutex::new(()),
+                prefill_admission: parking_lot::Mutex::new(()),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2167,6 +2174,7 @@ impl VllmPDRouter {
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 decode_admission: parking_lot::Mutex::new(()),
+                prefill_admission: parking_lot::Mutex::new(()),
             })
         }
     }
@@ -2395,7 +2403,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let (prefill_idx, decode_idx, decode_reservation) =
+            let (prefill_idx, decode_idx, prefill_reservation, decode_reservation) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers,
                     request_str, request_headers.as_ref()) {
                     Ok(v) => v,
@@ -2421,6 +2429,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    prefill_reservation,
                     "/v1/chat/completions",
                     headers,
                 )
@@ -2541,7 +2550,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let (prefill_idx, decode_idx, decode_reservation) =
+            let (prefill_idx, decode_idx, prefill_reservation, decode_reservation) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers,
                     request_str, request_headers.as_ref()) {
                     Ok(v) => v,
@@ -2567,6 +2576,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    prefill_reservation,
                     "/v1/completions",
                     headers,
                 )
@@ -2738,7 +2748,7 @@ impl RouterTrait for VllmPDRouter {
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let (prefill_idx, decode_idx, decode_reservation) =
+            let (prefill_idx, decode_idx, prefill_reservation, decode_reservation) =
                 match self.select_direct_pair(&prefill_workers, &decode_workers,
                     request_str, request_headers.as_ref()) {
                     Ok(v) => v,
@@ -2761,6 +2771,7 @@ impl RouterTrait for VllmPDRouter {
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
+                    prefill_reservation,
                     path,
                     headers,
                 )
@@ -2838,7 +2849,7 @@ mod tests {
                             let text = if hot { "same prefix".to_string() }
                                        else { format!("cold unique {i:04}") };
                             start.wait();
-                            let (idx, guard) = select_and_reserve_decode(
+                            let (idx, guard) = select_and_reserve_worker(
                                 admission, policy, workers, Some(&text), None).unwrap();
                             done.wait();
                             (idx, guard)
@@ -2899,6 +2910,64 @@ mod tests {
         assert_eq!(worker.load(), 0);
     }
 
+
+    #[test]
+    fn test_prefill_burst_reservations_c8_c16_c32() {
+        use crate::core::DPAwareWorker;
+        use crate::policies::{CacheAwareConfig, CacheAwarePolicy};
+        for concurrency in [8usize, 16, 32] {
+            for hot in [false, true] {
+                let workers: Vec<Arc<dyn Worker>> = (0..4).flat_map(|host| {
+                    (0..2).flat_map(move |instance| {
+                        (0..4).map(move |rank| Arc::new(DPAwareWorker::new(
+                            format!("http://host{host}:{}", 8000 + instance), rank, 4,
+                            WorkerType::Prefill { bootstrap_port: None },
+                        )) as Arc<dyn Worker>)
+                    })
+                }).collect();
+                let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                    balance_abs_threshold: 64,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 0,
+                    ..Default::default()
+                });
+                policy.init_workers(&workers);
+                let admission = parking_lot::Mutex::new(());
+                for _wave in 0..3 {
+                let start = std::sync::Barrier::new(concurrency);
+                let done = std::sync::Barrier::new(concurrency);
+                let reservations = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..concurrency).map(|request| {
+                        let (workers, policy, admission, start, done) =
+                            (&workers, &policy, &admission, &start, &done);
+                        scope.spawn(move || {
+                            let text = if hot { "identical prefix".to_string() }
+                                else { format!("unique request {request}") };
+                            start.wait();
+                            let (idx, guard) = select_and_reserve_worker(
+                                admission, policy, workers, Some(&text), None).unwrap();
+                            done.wait();
+                            (idx, guard)
+                        })
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+                });
+                let mut hosts = [0usize; 4];
+                let mut seen = std::collections::HashSet::new();
+                for (idx, _) in &reservations {
+                    assert!(seen.insert(*idx), "each rank reserved at most once");
+                    assert_eq!(workers[*idx].load(), 1);
+                    let host = workers[*idx].base_url().as_bytes()[11] - b'0';
+                    hosts[host as usize] += 1;
+                }
+                assert_eq!(hosts, [concurrency / 4; 4]);
+                drop(reservations);
+                assert!(workers.iter().all(|w| w.load() == 0));
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_reserved_unavailable_candidate_retry() {
         #[derive(Debug)]
@@ -2915,14 +2984,14 @@ mod tests {
         first.set_healthy(false);
         let workers = vec![first.clone(), second.clone()];
         let lock = parking_lot::Mutex::new(());
-        let (idx, guard) = select_and_reserve_decode(&lock, &FirstPolicy, &workers, None, None).unwrap();
+        let (idx, guard) = select_and_reserve_worker(&lock, &FirstPolicy, &workers, None, None).unwrap();
         assert_eq!(idx, 1);
         assert_eq!(first.load(), 0);
         assert_eq!(second.load(), 1);
         drop(guard);
         assert_eq!(second.load(), 0);
         second.set_healthy(false);
-        assert!(select_and_reserve_decode(&lock, &FirstPolicy, &workers, None, None).is_none());
+        assert!(select_and_reserve_worker(&lock, &FirstPolicy, &workers, None, None).is_none());
     }
 
     #[tokio::test]
