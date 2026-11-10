@@ -28,8 +28,8 @@ class RouterArgs:
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
-    balance_abs_threshold: int = 64
-    balance_rel_threshold: float = 1.5
+    balance_abs_threshold: int = 0
+    balance_rel_threshold: float = 1.2
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches

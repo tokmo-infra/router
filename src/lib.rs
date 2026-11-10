@@ -268,8 +268,8 @@ impl Router {
         worker_startup_timeout_secs = 600,
         worker_startup_check_interval = 30,
         cache_threshold = 0.3,
-        balance_abs_threshold = 64,
-        balance_rel_threshold = 1.5,
+        balance_abs_threshold = 0,
+        balance_rel_threshold = 1.2,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches

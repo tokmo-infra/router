@@ -159,3 +159,9 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+# CPU Router build deps: exact upstream git commit from Cargo.lock, archived locally.
+[patch."https://github.com/vllm-project/vllm"]
+vllm-chat = { path = "../vllm-rust-v029/rust/src/chat" }
+vllm-tokenizer = { path = "../vllm-rust-v029/rust/src/tokenizer" }
+vllm-text = { path = "../vllm-rust-v029/rust/src/text" }

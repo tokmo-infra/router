@@ -557,6 +557,61 @@ mod tests {
     use crate::core::{BasicWorker, WorkerType};
 
     #[test]
+    fn default_guard_same_policy_survives_low_high_low_transitions() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.balance_abs_threshold, 0);
+        assert_eq!(config.balance_rel_threshold, 1.2);
+        let mut policy = CacheAwarePolicy::with_config(config);
+        // This test is specifically for cache-aware, not the opt-in coupled-KV path.
+        policy.coupled_kv = None;
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular)),
+            Arc::new(BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular)),
+        ];
+        policy.init_workers(&workers);
+        let prefix = "identical reusable prompt prefix";
+        let mut active: Vec<usize> = Vec::new();
+        for target in [4usize, 8, 16, 32, 64, 128, 8, 4] {
+            let previous = active.len();
+            // Preserve this policy instance, tree, workers and in-flight requests
+            // while demand rises and falls; this is a policy test, not HTTP SSE.
+            while active.len() > target {
+                let idx = active.pop().unwrap();
+                workers[idx].decrement_load();
+            }
+            while active.len() < target {
+                let idx = policy.select_worker(&workers, Some(prefix)).unwrap();
+                workers[idx].increment_load();
+                active.push(idx);
+            }
+            assert_eq!(workers[0].load() + workers[1].load(), target);
+            if target > previous {
+                assert!(workers[0].load().abs_diff(workers[1].load()) <= std::cmp::max(1, target / 8),
+                        "rising load did not rebalance at C={target}");
+            }
+            // Inject a strong imbalance while retaining the same total load.
+            while workers[1].load() > 0 {
+                workers[1].decrement_load();
+                workers[0].increment_load();
+            }
+            let selected = policy.select_worker(&workers, Some(prefix)).unwrap();
+            assert_eq!(selected, 1, "failed to correct imbalance at C={target}");
+            // Restore an accurate request-to-worker accounting for the next step.
+            active.clear();
+            active.resize(target, 0usize);
+        }
+        for idx in active {
+            workers[idx].decrement_load();
+        }
+        assert_eq!((workers[0].load(), workers[1].load()), (0, 0));
+        let first = policy.select_worker(&workers, Some(prefix)).unwrap();
+        assert_eq!(policy.select_worker(&workers, Some(prefix)), Some(first));
+    }
+
+    #[test]
     fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
         let config = CacheAwareConfig {

@@ -156,8 +156,8 @@ impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
+            balance_abs_threshold: 0,
+            balance_rel_threshold: 1.2,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
         }

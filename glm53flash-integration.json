@@ -1,34 +1,17 @@
 {
-  "name": "glm5.3-flash-1103",
+  "name": "vllm-0.32.0-0.1.16-glm5.3-flash",
   "router_version": "0.1.16",
-  "repository": "https://github.com/tokmo-infra/router",
-  "branch": "glm5.3-flash-1103",
-  "image_tag": "router:glm53flash-1103",
-  "image_id": "sha256:300f9f516715d417592e050068d525dd6dc216df1f8934ae8db041e5c3611810",
-  "binary_sha256": "2dd7fd1614df198e3453e7a2b0f451b6409a88dc8aa24188d3e582d85cf35387",
-  "listener_sha256": "1470f99b88635edb0ffa0d2f9ac0644b3e6679273fa57f2ee12011a38f392139",
-  "build": {
-    "rust_image": "rust:1.99.1-bookworm",
-    "runtime_image": "router:vllm-yyf",
-    "target": "x86_64-unknown-linux-gnu",
-    "vllm_rust_tag": "v0.29.0",
-    "vllm_rust_commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
-    "locked": true
-  },
-  "source_tree_sha256": "12b8b07bad5333671a9e0ba8ebe2e1edc519f95b51a822e7740dff01eb3234e1",
-  "source_tree_digest_format": "Sorted src/**/*.rs, Cargo.toml and Cargo.lock; each relative path + NUL + file SHA256; LF-separated UTF-8 lines, no trailing LF.",
+  "source_base": "db02f358da401b60d4ae14eb286163763a0705cc",
+  "deployed_image": "sha256:0eee14a71f7b8027f0235bfb8b99eebc8416ca7cbf07b6776577fbd944810413",
+  "deployed_extension_sha256": "7096f5d8847141dc7a49f33ba1ca25beb937c7dd76209660c1e022e6c566f6e7",
   "source_files": [
     {
       "path": "Cargo.lock",
-      "sha256": "9cf546ed0e547b8c833802a3a3ebae472c2764bd4725d0793f9b55b2f6ae6f5a"
+      "sha256": "3f108f0cdb55f3153944403d98214712d603ffbb12b8f3ee7a325230b0170bce"
     },
     {
       "path": "Cargo.toml",
-      "sha256": "e32cb29d0b6f86562041531acbc6d1b0b1ec854673dfa2140143032ebc1b010e"
-    },
-    {
-      "path": "Dockerfile.router",
-      "sha256": "e2ccdc6b56172ba7134019aabe9be29340c2ab65e935999c5c4684222142208d"
+      "sha256": "40a7d347b7f172fe68b12f61cef203a581ea354720119d581a5c88563f5cfb41"
     },
     {
       "path": "src/core/worker_registry.rs",
@@ -48,45 +31,17 @@
     },
     {
       "path": "src/routers/http/vllm_pd_router.rs",
-      "sha256": "22cb7f5e905fe3305f73ce167d7af0f4c3b0a7499d80586586432d3b37f6be15"
-    },
-    {
-      "path": "src/program_scheduling/binding/mod.rs",
-      "sha256": "c4f191e2821f4390650432fd77fc7a9957d9200d34d749ea88695156fa2b6755"
-    },
-    {
-      "path": "src/config/validation.rs",
-      "sha256": "d103cc1aca510b20e754fdb4f528e2e6e0914362d0c000ffcc95bad1e593e41c"
-    },
-    {
-      "path": "src/policies/cache_aware.rs",
-      "sha256": "18ba044ae252eb3a0baa24021073ffa2bb88aac2efb4072c06f16580e09791a6"
-    },
-    {
-      "path": "src/tree.rs",
-      "sha256": "c4492241e39113cb550d8ac5b76d3c2698333dc95edf0fc9d9bde3cce0f02697"
+      "sha256": "bebb9a2154df9b1fc1114fe08f959d220cd6cd8459a58a559f45d3509875e1cd"
     }
   ],
+  "vllm_repository": "https://github.com/tokmo-infra/vllm",
+  "vllm_branch": "vllm-0.32.0-0.1.16-glm5.3-flash",
+  "C230_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT-C230.md",
   "validation": {
-    "linux_release_build": "passed",
-    "linux_library_tests": {
-      "command": "cargo test --release --locked --lib",
-      "passed": 725,
-      "failed": 0,
-      "ignored": 0
-    },
-    "prompt_id_handoff": "passed; malformed IDs rejected before decode",
-    "mooncake_handoff": "passed; 16 requests, concurrency 8, 131072 token IDs; CPU fake backends only",
-    "removed_config": "absent from new binary; obsolete environment ignored during both contract tests",
-    "bash_blocks": 25,
-    "offline_model_commands": 20,
-    "offline_router_commands": 5
+    "CPU_tests": "reuse original Linux test binary built from matching archived source",
+    "reservation_cases": 5,
+    "pd_usage_cases": 12,
+    "kv_hash_cases": 6
   },
-  "deployments": {
-    "router": "https://github.com/tokmo-infra/router/blob/glm5.3-flash-1103/DEPLOYMENT.md",
-    "vllm_repository": "https://github.com/tokmo-infra/vllm",
-    "vllm_branch": "glm5.3-flash-1103",
-    "1p2d": "deployment1p2d.md",
-    "4p4d": "deployment4p4d.md"
-  }
+  "current_deployment": "https://github.com/tokmo-infra/vllm/blob/vllm-0.32.0-0.1.16-glm5.3-flash/DEPLOYMENT.md"
 }

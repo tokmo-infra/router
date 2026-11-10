@@ -205,9 +205,9 @@ The `cache_aware` policy optimizes for prefix caching by maintaining an approxim
 ```bash
 vllm-router --policy cache_aware \
   --cache-threshold 0.5 \
-  --balance-abs-threshold 32 \
-  --balance-rel-threshold 1.1 \
-  --worker-urls http://worker1:8000,http://worker2:8000
+  --balance-abs-threshold 0 \
+  --balance-rel-threshold 1.2 \
+  --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
 ### Parameters
@@ -215,17 +215,25 @@ vllm-router --policy cache_aware \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
-| `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
-| `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
+| `balance_abs_threshold` | 0 | Absolute load difference threshold for load balancing |
+| `balance_rel_threshold` | 1.2 | Relative load ratio threshold for load balancing |
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
 | `max_tree_size` | 10000 | Maximum nodes per radix tree |
 
 ### Behavior
 
+The same configuration automatically checks request load at low and high
+concurrency, including after load falls again; it does not require a day/night
+switch or a router restart. When both `max_load - min_load > 0` and
+`max_load > 1.2 * min_load`, the router chooses a least-loaded healthy
+worker. Otherwise it preserves prefix affinity when possible. These are
+request-count thresholds, not a promise of instantaneous 1:1 balance, equal KV
+usage, or equal latency. Explicit threshold overrides remain supported.
+
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to a healthy worker with the smallest request load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)

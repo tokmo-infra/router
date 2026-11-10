@@ -164,11 +164,11 @@ struct CliArgs {
     cache_threshold: f32,
 
     /// Absolute threshold for load balancing
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 0)]
     balance_abs_threshold: usize,
 
     /// Relative threshold for load balancing
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = 1.2)]
     balance_rel_threshold: f32,
 
     /// Interval in seconds between cache eviction operations
@@ -758,6 +758,26 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_aware_balance_defaults_and_overrides() {
+        let defaults = CliArgs::try_parse_from(["vllm-router"]).unwrap();
+        assert_eq!(defaults.policy, "cache_aware");
+        assert_eq!(defaults.balance_abs_threshold, 0);
+        assert_eq!(defaults.balance_rel_threshold, 1.2);
+        match defaults.parse_policy("cache_aware") {
+            PolicyConfig::CacheAware { balance_abs_threshold, balance_rel_threshold, .. } => {
+                assert_eq!(balance_abs_threshold, 0);
+                assert_eq!(balance_rel_threshold, 1.2);
+            }
+            _ => panic!("expected cache-aware policy"),
+        }
+        let explicit = CliArgs::try_parse_from([
+            "vllm-router", "--balance-abs-threshold", "64", "--balance-rel-threshold", "1.5",
+        ]).unwrap();
+        assert_eq!(explicit.balance_abs_threshold, 64);
+        assert_eq!(explicit.balance_rel_threshold, 1.5);
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
