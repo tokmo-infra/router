@@ -160,6 +160,7 @@ pub struct Router {
     program_scheduler: Option<Arc<ProgramScheduler>>,
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
+    dispatch_selection_lock: Mutex<()>,
     program_token_estimator: Arc<MomentumTokenEstimator>,
 }
 
@@ -366,6 +367,7 @@ impl Router {
             program_scheduler,
             _program_observation_handle: program_observation_handle,
             program_targets_cache: Mutex::new(HashMap::new()),
+            dispatch_selection_lock: Mutex::new(()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         })
     }
@@ -1028,6 +1030,35 @@ impl Router {
         Some(available[idx].clone())
     }
 
+    fn select_reserved_worker_for_model(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        forced_worker_url: Option<&str>,
+    ) -> Option<(Arc<dyn Worker>, bool)> {
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let reserve_load = policy.name() == "cache_aware" || forced_worker_url.is_some();
+        // Reserve before another arrival can observe the same idle worker.
+        // The guard never crosses network I/O or an await point.
+        let _selection_guard = reserve_load.then(|| self.dispatch_selection_lock.lock());
+        let worker = if let Some(target) = forced_worker_url {
+            self.worker_registry
+                .get_by_url(target)
+                .filter(|worker| worker.is_available())?
+        } else {
+            self.select_worker_for_model(model_id, text, headers)?
+        };
+        if reserve_load {
+            worker.increment_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+        Some((worker, reserve_load))
+    }
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1100,20 +1131,17 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
-                    let worker = self
-                        .worker_registry
-                        .get_by_url(target)
-                        .filter(|worker| worker.is_available());
-                    let Some(worker) = worker else {
+                let selected_worker = self.select_reserved_worker_for_model(
+                    model_id,
+                    Some(&text),
+                    headers,
+                    forced_worker_url,
+                );
+                let (worker, load_incremented) = match selected_worker {
+                    Some(selected) => selected,
+                    None if forced_worker_url.is_some() => {
                         return Self::program_target_unavailable_response(route);
-                    };
-                    Some(worker)
-                } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
-                };
-                let worker = match selected_worker {
-                    Some(w) => w,
+                    }
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
                         return (
@@ -1123,22 +1151,6 @@ impl Router {
                             .into_response();
                     }
                 };
-
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
 
                 // Keep a clone for potential cleanup on retry
                 let worker_for_cleanup = if load_incremented {
@@ -2684,6 +2696,7 @@ mod tests {
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
+            dispatch_selection_lock: Mutex::new(()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
     }
@@ -2715,6 +2728,7 @@ mod tests {
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
+            dispatch_selection_lock: Mutex::new(()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
     }
@@ -2979,6 +2993,7 @@ mod tests {
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
+            dispatch_selection_lock: Mutex::new(()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
     }
@@ -3332,5 +3347,95 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    #[test]
+    fn test_concurrent_cold_dep16_dispatch_reserves_balanced_load() {
+        use crate::core::DPAwareWorker;
+        use std::sync::Barrier;
+        for trial in 0..8 {
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.policy_registry = Arc::new(PolicyRegistry::new(
+                crate::config::types::PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 64,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 0,
+                    max_tree_size: 2_147_483_648,
+                },
+            ));
+            for rank in 0..16 {
+                router.worker_registry.register(Arc::new(DPAwareWorker::new(
+                    "http://head:19483".into(),
+                    rank,
+                    16,
+                    WorkerType::Regular,
+                )));
+            }
+            router
+                .policy_registry
+                .get_default_policy()
+                .init_workers(&router.worker_registry.get_all());
+            let router = Arc::new(router);
+            let barrier = Arc::new(Barrier::new(32));
+            let placements = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..32)
+                    .map(|slot| {
+                        let router = router.clone();
+                        let barrier = barrier.clone();
+                        scope.spawn(move || {
+                            let text = format!("{slot:03}-{}", "cold-long-prefix ".repeat(2000));
+                            barrier.wait();
+                            let (worker, reserved) = router
+                                .select_reserved_worker_for_model(None, Some(&text), None, None)
+                                .unwrap();
+                            assert!(reserved);
+                            worker.dp_rank().unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut counts = [0usize; 16];
+            for rank in placements {
+                counts[rank] += 1;
+            }
+            eprintln!("trial {trial}: {counts:?}");
+            assert_eq!(
+                counts, [2; 16],
+                "concurrent placement and reservation must be atomic"
+            );
+            for worker in router.worker_registry.get_all() {
+                assert_eq!(worker.load(), 2);
+                worker.decrement_load();
+                worker.decrement_load();
+                assert_eq!(worker.load(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_reserved_dispatch_preserves_round_robin_and_forced_target_accounting() {
+        let router = create_test_regular_router();
+        let (worker, reserved) = router
+            .select_reserved_worker_for_model(None, None, None, None)
+            .unwrap();
+        assert!(!reserved);
+        assert_eq!(worker.load(), 0);
+        let (forced, reserved) = router
+            .select_reserved_worker_for_model(None, None, None, Some(worker.url()))
+            .unwrap();
+        assert!(reserved);
+        assert_eq!(forced.load(), 1);
+        forced.decrement_load();
+        forced.set_healthy(false);
+        assert!(router
+            .select_reserved_worker_for_model(None, None, None, Some(forced.url()))
+            .is_none());
+        assert_eq!(forced.load(), 0);
     }
 }
