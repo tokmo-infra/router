@@ -1,0 +1,35 @@
+{
+  "existing_rust_router": {
+    "container": "kimi31-pd-hisparse-92-router-full-c256-r14",
+    "container_id": "24bdee636d9275aefb56205256cc7243d26004a10292b9d346d0f7eabebbd03c",
+    "image": "sha256:55b0495c0784ed15003156818c7a911dde678d3352ab791418df12de025b7981",
+    "started_at": "2026-11-14T05:46:47.403025219Z",
+    "restart_count": 0,
+    "labels": {
+      "ai-infra.node": "92",
+      "ai-infra.owner": "xinhao",
+      "ai-infra.plan": "kimi31-b300-92-93-p8-d8-tp8-dcp8-ep8",
+      "ai-infra.role": "router",
+      "ai-infra.runtime": "unmodified official main CI runtime",
+      "ai.infra.source.binary_sha256": "28b5ff2e37ce85761a31092673f36200017c2fb21c363087805ff032af794cde",
+      "ai.infra.source.parent": "93f02af746d2c792e6c5199d4bd6d0c0960fa44b",
+      "ai.infra.source.pd_router_sha256": "ec0d202770c5ffc3bfbc24ba7a794f74c837f993dabcf0cffa59e63aaf8e928c",
+      "ai.infra.source.pd_usage_sha256": "719fdd92776cf639951f869f9753b91086e8004dcad40bf9038365405ee891be",
+      "ai.infra.source.round_robin_sha256": "8c63baf09f2a57ddeca8829066d8e964fdba266a948ee62faba5805a0980b96d",
+      "io.xinhao.router.mooncake-metadata": "immutable-readonly",
+      "io.xinhao.router.native-source-image": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
+      "io.xinhao.router.parent-revision": "e9b04213d0cd6084a1bf2e8d98fa90e9422f9f1d",
+      "io.xinhao.router.prefill-eos-policy": "length-cap-opt-in",
+      "io.xinhao.router.release": "vllm-0.32.0-0.1.16-glm5.3-flash",
+      "io.xinhao.router.tokenids": "native-D-reuse-opt-in",
+      "org.opencontainers.image.base.digest": "sha256:edd167d216ba073155ce6a317196013f54b12e4645abc51cededc16abe138454",
+      "org.opencontainers.image.revision": "96885611f4f7ab33d2661cb8aeffbabff44784b0",
+      "org.opencontainers.image.source": "https://github.com/tokmo-infra/router"
+    },
+    "binary_sha256": "28b5ff2e37ce85761a31092673f36200017c2fb21c363087805ff032af794cde"
+  },
+  "hybrid_source_sha256": "148b8b3c61e8582c3fd418c568691cbdf17d9cb0f4dffe03088f6be25e4a207a",
+  "validation": "13 loopback HTTP/SSE tests including C288 weighted5:9, cancellation and timeout passed; no inference/GPU probes",
+  "baseline_ingress": "11.5.0.92:19510 weights1:2",
+  "next_ingress": "11.5.0.92:19511 weights5:9"
+}

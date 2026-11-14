@@ -1,0 +1,2 @@
+# Already present in the pinned P image; used for CPU-only local validation.
+aiohttp==3.14.5
