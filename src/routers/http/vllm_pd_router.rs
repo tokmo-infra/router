@@ -1178,6 +1178,9 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
+                if path == "/v1/responses" && prefill_status.is_client_error() {
+                    return Ok(Self::forward_upstream_response(prefill_response));
+                }
                 let error_body = prefill_response.text().await.unwrap_or_default();
                 return Err(format!(
                     "Prefill server error {}: {}",
@@ -1331,15 +1334,7 @@ impl VllmPDRouter {
                             }
                         }
                     }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        warn!("Concurrent prefill returned non-2xx status: {}", status);
-                        Err(format!("Prefill request failed with status {}", status))
-                    }
-                    Err(e) => {
-                        warn!("Concurrent prefill request failed: {}", e);
-                        Err(format!("Prefill request failed: {}", e))
-                    }
+                    failure => Err(failure),
                 }
             };
             let decode_fut = otel_http::send_client_request(
@@ -1354,7 +1349,7 @@ impl VllmPDRouter {
             );
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
             let concurrent_prefill_response_json: Option<Value> = match prefill_result {
-                Err(prefill_err) => {
+                Err(failure) => {
                     self.stop_profiling(&format!("http://{}", decode_base_http))
                         .await;
                     let duration = start_time.elapsed();
@@ -1362,6 +1357,13 @@ impl VllmPDRouter {
                     RouterMetrics::record_pd_request(path);
                     RouterMetrics::record_pd_request_duration(path, duration);
                     RouterMetrics::record_pd_prefill_request(prefill_http);
+                    let prefill_err = match failure {
+                        Ok(resp) if path == "/v1/responses" && resp.status().is_client_error() => {
+                            return Ok(Self::forward_upstream_response(resp));
+                        }
+                        Ok(resp) => format!("Prefill request failed with status {}", resp.status()),
+                        Err(error) => format!("Prefill request failed: {error}"),
+                    };
                     return Err(format!(
                         "Prefill request failed to {}: {}",
                         prefill_http, prefill_err
@@ -1604,6 +1606,13 @@ impl VllmPDRouter {
         );
 
         let prefill_status = prefill_response.status();
+        if path == "/v1/responses" && prefill_status.is_client_error() {
+            self.stop_profiling(&prefill_base_url).await;
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            return Ok(Self::forward_upstream_response(prefill_response));
+        }
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1984,6 +1993,9 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                if path == "/v1/responses" && resp.status().is_client_error() {
+                    return Ok(Self::forward_upstream_response(resp));
+                }
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",
@@ -2802,13 +2814,15 @@ impl VllmPDRouter {
         )
         .await
         {
-            Ok(upstream) => {
-                let status = upstream.status();
-                let headers = header_utils::preserve_response_headers(upstream.headers());
-                (status, headers, Body::from_stream(upstream.bytes_stream())).into_response()
-            }
+            Ok(upstream) => Self::forward_upstream_response(upstream),
             Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
         }
+    }
+
+    fn forward_upstream_response(upstream: reqwest::Response) -> Response {
+        let status = upstream.status();
+        let headers = header_utils::preserve_response_headers(upstream.headers());
+        (status, headers, Body::from_stream(upstream.bytes_stream())).into_response()
     }
 
     async fn forward_pd(

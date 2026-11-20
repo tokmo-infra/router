@@ -63,6 +63,18 @@ class Worker(BaseHTTPRequestHandler):
         if self.path == RESPONSES and body.get("previous_response_id"):
             self.reply({"error": {"message": "Response with this ID not found."}}, 404)
             return
+        if self.path == RESPONSES and body.get("input") == 17:
+            self.reply(
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "param": "input",
+                        "message": "Expected text or items.",
+                    }
+                },
+                400,
+            )
+            return
         if self.path == MESSAGES:
             usage = dict(USAGE)
             fixture = body["messages"][0]["content"]
@@ -377,6 +389,82 @@ class MooncakeDialogueTest(unittest.TestCase):
             500,
         )
         self.assertEqual([c[0] for c in self.calls[start:]], ["P"])
+
+    def test_responses_compatibility_at_ingress(self):
+        function = {"name": "lookup", "parameters": {"type": "object"}, "strict": False}
+        parts = [{"type": "output_text", "text": "first", "annotations": []}]
+        history = [{"role": "assistant", "content": parts}, user("next")]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                start = len(self.calls)
+                status, data = self.post(
+                    RESPONSES,
+                    {
+                        "input": history,
+                        "tools": [{"type": "function", "function": function}],
+                        "tool_choice": {
+                            "type": "function",
+                            "function": {"name": "lookup"},
+                        },
+                        "stream": stream,
+                    },
+                )
+                self.assertEqual(status, 200, data)
+                completed = data[-1]["response"] if stream else data
+                self.assertEqual(completed["status"], "completed")
+                self.assertEqual([call[0] for call in self.calls[start:]], ["P", "D"])
+                for _, _, _, sent, _ in self.calls[start:]:
+                    self.assertEqual(sent["tools"], [{"type": "function", **function}])
+                    self.assertEqual(
+                        sent["tool_choice"], {"type": "function", "name": "lookup"}
+                    )
+                    self.assertEqual(
+                        sent["input"][0], {"type": "message", **history[0]}
+                    )
+                start = len(self.calls)
+                self.assertEqual(
+                    self.post(
+                        RESPONSES,
+                        {
+                            "previous_response_id": completed["id"],
+                            "input": "last",
+                        },
+                    )[0],
+                    200,
+                )
+                self.assertEqual(
+                    self.calls[start][3]["input"][0], {"type": "message", **history[0]}
+                )
+
+    def test_responses_validation_errors(self):
+        start = len(self.calls)
+        status, raw = self.post(
+            RESPONSES,
+            {
+                "input": "ok",
+                "tools": [
+                    {"type": "function", "name": "one", "function": {"name": "two"}}
+                ],
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw)["error"]["param"], "tools[0].name")
+        self.assertEqual(len(self.calls), start)
+        for stream in (True, False):
+            start = len(self.calls)
+            status, raw = self.post(
+                RESPONSES, {"store": False, "input": 17, "stream": stream}
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                json.loads(raw)["error"],
+                {
+                    "param": "input",
+                    "type": "invalid_request_error",
+                    "message": "Expected text or items.",
+                },
+            )
+            self.assertEqual([c[0] for c in self.calls[start:]], ["P"])
 
     def test_count_is_prefill_only(self):
         for messages, expected in [([user("count this")], 200), ([], 400)]:
