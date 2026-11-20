@@ -177,7 +177,87 @@ fn build_prefill_request_builder(
     dp_utils::add_dp_rank_header(builder, dp_rank)
 }
 
+// Pydantic errors can include the original prompt or image data. Return the
+// parameter error without copying input values or private worker addresses.
+fn input_rejection(path: &str, status: StatusCode) -> Option<Response> {
+    if !matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY) {
+        return None;
+    }
+    let mut body = json!({"error": {"type": "invalid_request_error", "message": "Invalid request parameters for this endpoint."}});
+    if path.starts_with("/v1/messages") { body["type"] = json!("error"); }
+    Some((status, axum::Json(body)).into_response())
+}
+
+fn reject_stateful_responses(path: &str, body: &Value) -> Option<Response> {
+    if path != "/v1/responses"
+        || !body.get("previous_response_id").is_some_and(|id| !id.is_null())
+    {
+        return None;
+    }
+    let body = json!({"error": {
+        "type": "invalid_request_error",
+        "code": "previous_response_id_unsupported",
+        "param": "previous_response_id",
+        "message": "This P/D endpoint does not store response history. Remove previous_response_id and resend the full conversation in input."
+    }});
+    Some((StatusCode::BAD_REQUEST, axum::Json(body)).into_response())
+}
+
+/// Accept Chat Completions-style function definitions on the stateless
+/// Responses endpoint. Leave already-flat and non-function tools untouched.
+fn normalize_responses_function_tools(path: &str, body: &mut Value) -> Result<(), String> {
+    if path != "/v1/responses" {
+        return Ok(());
+    }
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (index, tool) in tools.iter_mut().enumerate() {
+        let Some(tool) = tool.as_object_mut() else { continue };
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            continue;
+        }
+        let Some(wrapper) = tool.remove("function") else { continue };
+        let Value::Object(fields) = wrapper else {
+            return Err(format!("tools[{index}].function must be an object."));
+        };
+        for (field, value) in fields {
+            if !matches!(field.as_str(), "name" | "description" | "parameters" | "strict") {
+                return Err(format!("tools[{index}].function contains an unsupported field."));
+            }
+            if let Some(existing) = tool.get(&field) {
+                if existing != &value {
+                    return Err(format!("tools[{index}].{field} conflicts with tools[{index}].function.{field}."));
+                }
+            } else {
+                tool.insert(field, value);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl VllmPDRouter {
+    // Only two fixed metadata routes, only to healthy P addresses verified
+    // at startup. Client authorization is handled by the public HTTP handler.
+    async fn mooncake_metadata(&self, count: Option<&Value>, headers: &HeaderMap) -> Response {
+        let base = self.pd_router.worker_registry.get_prefill_workers().into_iter()
+            .filter(|w| w.is_available()).map(|w| dp_utils::parse_worker_url(w.url()).0)
+            .find(|url| self.mooncake_prefill_info.contains_key(url));
+        let Some(base) = base else { return StatusCode::SERVICE_UNAVAILABLE.into_response(); };
+        let path = if count.is_some() { "/v1/messages/count_tokens" } else { "/v1/models" };
+        let url = format!("{base}{path}");
+        let mut req = match count { Some(v) => self.pd_router.client.post(url).json(v), None => self.pd_router.client.get(url) };
+        if let Ok(key) = std::env::var("OPENAI_API_KEY") { if !key.is_empty() { req = req.bearer_auth(key); } }
+        for name in ["anthropic-version", "anthropic-beta"] {
+            if let Some(value) = headers.get(name) { req = req.header(name, value); }
+        }
+        let Ok(res) = req.send().await else { return StatusCode::BAD_GATEWAY.into_response(); };
+        let status = res.status();
+        if let Some(err) = input_rejection(path, status) { return err; }
+        if !status.is_success() { return StatusCode::BAD_GATEWAY.into_response(); }
+        match res.json::<Value>().await { Ok(v) => (status, axum::Json(v)).into_response(), Err(_) => StatusCode::BAD_GATEWAY.into_response() }
+    }
     fn select_direct_pair(
         &self, ps: &[Arc<dyn Worker>], ds: &[Arc<dyn Worker>],
         text: Option<&str>, headers: Option<&RequestHeaders>,
@@ -1145,6 +1225,7 @@ impl VllmPDRouter {
             debug!("Prefill server responded with status: {}", prefill_status);
 
             if !prefill_status.is_success() {
+                if let Some(err) = input_rejection(path, prefill_status) { return Ok(err); }
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
@@ -1576,6 +1657,7 @@ impl VllmPDRouter {
         );
 
         let prefill_status = prefill_response.status();
+        if let Some(err) = input_rejection(path, prefill_status) { return Ok(err); }
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -2252,6 +2334,9 @@ impl RouterTrait for VllmPDRouter {
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
+        if !self.use_discovery && matches!(self.kv_connector, KvConnector::Mooncake) {
+            return self.mooncake_metadata(None, req.headers()).await;
+        }
         self.pd_router.get_models(req).await
     }
 
@@ -2681,7 +2766,7 @@ impl RouterTrait for VllmPDRouter {
         headers: Option<&HeaderMap>,
         path: &str,
         method: &Method,
-        body: serde_json::Value,
+        mut body: serde_json::Value,
     ) -> Response {
         // Only handle POST requests for inference
         if *method != Method::POST {
@@ -2692,11 +2777,26 @@ impl RouterTrait for VllmPDRouter {
                 .into_response();
         }
 
+        if let Some(rejection) = reject_stateful_responses(path, &body) {
+            return rejection;
+        }
+        if let Err(message) = normalize_responses_function_tools(path, &mut body) {
+            return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": {
+                "type": "invalid_request_error",
+                "code": "invalid_function_tool",
+                "param": "tools",
+                "message": message,
+            }}))).into_response();
+        }
+
         debug!(
             "Transparent proxy: routing {} {} through P/D pipeline",
             method, path
         );
 
+        if path == "/v1/messages/count_tokens" && !self.use_discovery && matches!(self.kv_connector, KvConnector::Mooncake) {
+            return self.mooncake_metadata(Some(&body), &headers.cloned().unwrap_or_default()).await;
+        }
         // Body is already a serde_json::Value, use it directly
         let request_json = body;
 
@@ -2817,6 +2917,65 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn responses_function_wrapper_compat_preserves_other_fields() {
+        let mut body = json!({"tools": [
+            {"type": "function", "name": "flat", "strict": true},
+            {"type": "web_search"},
+            {"type": "function", "name": "wrapped", "function": {
+                "name": "wrapped", "description": "test", "strict": false,
+                "parameters": {"type": "object", "properties": {}}
+            }}
+        ], "tool_choice": {"type": "function", "name": "wrapped"},
+           "input": [{"role":"assistant", "content":[{"type":"output_text", "text":"x"}]}]});
+        let before = body.clone();
+        normalize_responses_function_tools("/v1/chat/completions", &mut body).unwrap();
+        assert_eq!(body, before);
+        normalize_responses_function_tools("/v1/responses", &mut body).unwrap();
+        assert_eq!(body["tools"][0], before["tools"][0]);
+        assert_eq!(body["tools"][1], before["tools"][1]);
+        assert_eq!(body["tools"][2], json!({"type":"function", "name":"wrapped",
+            "description":"test", "strict":false, "parameters":{"type":"object", "properties":{}}}));
+        assert_eq!(body["input"], before["input"]);
+        assert_eq!(body["tool_choice"], before["tool_choice"]);
+    }
+
+    #[test]
+    fn responses_function_wrapper_compat_rejects_ambiguous_or_invalid_values() {
+        for tool in [json!({"type":"function","name":"a","function":{"name":"b"}}),
+                     json!({"type":"function","function":null}),
+                     json!({"type":"function","function":{"name":"a","unsupported":true}})] {
+            assert!(normalize_responses_function_tools("/v1/responses", &mut json!({"tools":[tool]})).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_rejects_id_instead_of_dropping_history() {
+        for previous_id in [json!("resp_test"), json!(""), json!(123)] {
+            let body = json!({"previous_response_id": previous_id, "input": "next"});
+            let response = reject_stateful_responses("/v1/responses", &body).unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["error"]["param"], "previous_response_id");
+            assert_eq!(result["error"]["code"], "previous_response_id_unsupported");
+            assert!(!std::str::from_utf8(&bytes).unwrap().contains("resp_test"));
+        }
+    }
+
+    #[test]
+    fn responses_preserves_stateless_history_and_other_routes() {
+        let input = json!([{"role":"user","content":"first"},
+                           {"role":"assistant","content":"answer"},
+                           {"role":"user","content":"next"}]);
+        for body in [json!({"input": input}), json!({"input": input, "previous_response_id": null})] {
+            assert!(reject_stateful_responses("/v1/responses", &body).is_none());
+        }
+        assert!(reject_stateful_responses("/v1/chat/completions", &json!({
+            "previous_response_id": "resp_test"
+        })).is_none());
+    }
 
     fn reserved_test_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode))

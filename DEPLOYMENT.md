@@ -2,6 +2,10 @@
 
 P使用 `cache_aware`，D使用 `round_robin`。同一套Router命令支持1P2D和4P4D，配套模型服务使用vLLM同名分支的部署文档。Router不加载估算Tokenizer或token容量JSON，Program scheduling保持关闭。
 
+`/v1/responses` 不在服务端保存对话。续聊时在 `input` 里发送完整历史；`previous_response_id` 留空（省略或 `null`）。传入非 null 值（含空字符串）时，Router 返回 HTTP 400，响应中的 `error.code` 为 `previous_response_id_unsupported`。同一请求不会进入 P/D；不影响 Mooncake KV 缓存。
+
+Responses 的 `tools` 同时接受扁平函数定义和 `{"type":"function","function":{...}}` 包装。Router 转发前展开 `name`、`description`、`parameters`、`strict`；同名字段值冲突时返回 HTTP 400（`invalid_function_tool`）。续聊仍在 `input` 中携带完整历史。
+
 ## 字段作用与使用案例
 
 | 字段 | 配置 | 作用与使用案例 |
