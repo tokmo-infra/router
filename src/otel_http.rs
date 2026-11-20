@@ -62,6 +62,18 @@ pub fn prepare_client_request(
     incoming_headers: Option<&HeaderMap>,
     options: ClientRequestOptions<'_>,
 ) -> PreparedClientRequest {
+    if options.request_phase.is_some()
+        && matches!(
+            options.route,
+            Some("/v1/messages" | "/v1/messages/count_tokens")
+        )
+    {
+        request = crate::routers::header_utils::propagate_headers(
+            request,
+            incoming_headers,
+            &["anthropic-version", "anthropic-beta"],
+        );
+    }
     let span = if crate::otel_trace::is_otel_enabled() {
         let span = info_span!(
             target: "otel_trace",
