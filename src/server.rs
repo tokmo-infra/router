@@ -252,12 +252,25 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    body: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error @ axum::extract::rejection::JsonRejection::JsonDataError(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {
+                    "type": "invalid_request_error", "message": error.body_text()
+                }})),
+            )
+                .into_response();
+        }
+        Err(error) => return error.into_response(),
+    };
     state.router.route_chat(Some(&headers), &body, None).await
 }
 

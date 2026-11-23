@@ -118,14 +118,19 @@ impl<'de> Deserialize<'de> for ChatMessage {
             .as_str()
             .ok_or_else(|| D::Error::custom("role field must be a string"))?;
 
+        let parse_content = |content: &Value| {
+            serde_json::from_value(content.clone())
+                .map_err(|err| D::Error::custom(format!("invalid {role} message content: {err}")))
+        };
+
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|content| {
-                    (!content.is_null())
-                        .then(|| serde_json::from_value(content.clone()).ok())
-                        .flatten()
-                }),
+                content: value
+                    .get("content")
+                    .filter(|v| !v.is_null())
+                    .map(parse_content)
+                    .transpose()?,
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -159,10 +164,11 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|content| serde_json::from_value(content.clone()).ok())
-                    .unwrap_or(UserMessageContent::Text(String::new())),
+                content: parse_content(
+                    value
+                        .get("content")
+                        .ok_or_else(|| D::Error::missing_field("content"))?,
+                )?,
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -172,13 +178,11 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }),
             }),
             "user" => {
-                let content = value
-                    .get("content")
-                    .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
-                    })
-                    .unwrap_or(UserMessageContent::Text(String::new()));
+                let content = parse_content(
+                    value
+                        .get("content")
+                        .ok_or_else(|| D::Error::missing_field("content"))?,
+                )?;
                 Ok(ChatMessage::User {
                     role: role.to_string(),
                     content,
@@ -295,6 +299,13 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4029,6 +4040,25 @@ mod tests {
                 ..
             } => assert_eq!(content, "You are a helpful assistant."),
             _ => panic!("Expected System message"),
+        }
+    }
+
+    #[test]
+    fn video_chat_preserves_part_order_and_rejects_invalid_content() {
+        let mut message = serde_json::json!({
+            "role": "user",
+            "content": [{"type":"text","text":"before"},
+                        {"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA=="}},
+                        {"type":"text","text":"after"}]
+        });
+        let parsed: ChatMessage = serde_json::from_value(message.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), message);
+        for invalid in [
+            serde_json::json!({"type":"unknown"}),
+            serde_json::json!({"type":"video_url","video_url":{}}),
+        ] {
+            message["content"][1] = invalid;
+            assert!(serde_json::from_value::<ChatMessage>(message.clone()).is_err());
         }
     }
 
