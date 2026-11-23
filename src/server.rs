@@ -122,7 +122,7 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let method = req.method().clone();
 
     // Read body
-    let body = if path == "/v1/messages" {
+    let body = if matches!(path.as_str(), "/v1/messages" | "/v1/messages/count_tokens") {
         // Use the same configured extractor limit for fixed and streamed bodies.
         axum::body::Bytes::from_request(req, &state)
             .await
@@ -256,18 +256,56 @@ async fn inference_generate(
         .await
 }
 
+fn kimi_media_shorthand(bytes: &[u8]) -> Option<ChatCompletionRequest> {
+    let mut body: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let model = body.get("model")?.as_str()?.rsplit('/').next()?;
+    if !model.eq_ignore_ascii_case("kimi-k3.1-pro") {
+        return None;
+    }
+    let mut changed = false;
+    for message in body.get_mut("messages")?.as_array_mut()? {
+        if let Some(parts) = message.get_mut("content").and_then(|value| value.as_array_mut()) {
+            for part in parts {
+                let key = match part["type"].as_str() {
+                    Some("image_url") => "image_url",
+                    Some("video_url") => "video_url",
+                    _ => continue,
+                };
+                if let Some(url) = part.get_mut(key).filter(|value| value.is_string()) {
+                    let value = url.take();
+                    *url = json!({ "url": value });
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::from_value(body).ok()
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    body: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
+    req: Request,
 ) -> Response {
-    if let Err(response) = authorize_request(&state, &headers).await {
+    let (parts, body) = req.into_parts();
+    if let Err(response) = authorize_request(&state, &parts.headers).await {
         return response;
     }
-
-    let body = match body {
+    let headers = parts.headers.clone();
+    // Keep Axum's content-type check, body limits and typed JSON errors.
+    let bytes = match axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), &state).await {
+        Ok(bytes) => bytes,
+        Err(error) => return error.into_response(),
+    };
+    let request = Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
+    let body = match Json::<ChatCompletionRequest>::from_request(request, &state).await {
         Ok(Json(body)) => body,
         Err(error @ axum::extract::rejection::JsonRejection::JsonDataError(_)) => {
+            if let Some(body) = kimi_media_shorthand(&bytes) {
+                return state.router.route_chat(Some(&headers), &body, None).await;
+            }
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": {
@@ -829,10 +867,9 @@ pub fn build_app_with_wasm_middleware(
     }
 
     if enable_transparent_proxy {
-        protected_routes = protected_routes.route(
-            "/v1/messages",
-            axum::routing::any(transparent_proxy_handler),
-        );
+        protected_routes = protected_routes
+            .route("/v1/messages", axum::routing::any(transparent_proxy_handler))
+            .route("/v1/messages/count_tokens", axum::routing::any(transparent_proxy_handler));
     }
     let protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
         app_state.clone(),
@@ -1266,6 +1303,24 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_chat_preserves_media_urls_and_fixed_top_p_on_the_wire() {
+        let mut request = json!({"model": "kimi-k3.1-pro", "top_p": 0.95,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": "data:image/png;base64,AA=="},
+                {"type": "video_url", "video_url": "data:video/mp4;base64,AA=="}
+            ]}]});
+        let parsed = kimi_media_shorthand(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let forwarded = serde_json::to_value(parsed).unwrap();
+        assert_eq!(forwarded["top_p"], json!(0.95));
+        for (index, key) in [(0, "image_url"), (1, "video_url")] {
+            assert_eq!(forwarded["messages"][0]["content"][index][key]["url"],
+                request["messages"][0]["content"][index][key]);
+        }
+        request["model"] = json!("deepseek-v4.1-flash-1017");
+        assert!(kimi_media_shorthand(&serde_json::to_vec(&request).unwrap()).is_none());
+    }
 
     #[tokio::test]
     async fn test_bind_listener_sets_tcp_nodelay_on_accepted_connections() {

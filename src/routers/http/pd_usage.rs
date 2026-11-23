@@ -47,6 +47,18 @@ pub fn attach_mooncake_prefill_usage(
     if !params.is_object() {
         return Err("Mooncake transfer params must be an object");
     }
+    if prefill["model"].as_str().is_some_and(|model| model.eq_ignore_ascii_case("kimi-k3.1-pro")) {
+        let measured = if prefill["type"] == "message" {
+            &usage["cache_creation_input_tokens"]
+        } else if prefill["object"] == "response" {
+            &usage["input_tokens_details"]["cache_write_tokens"]
+        } else {
+            let details = &usage["prompt_tokens_details"];
+            details.get("cache_write_tokens").unwrap_or(&details["created_cache_tokens"])
+        };
+        let created = measured.as_u64().ok_or("missing or invalid measured P cache creation")?;
+        params["remote_prefill_cache_creation_tokens"] = json!(created);
+    }
     params["remote_prefill_cached_tokens"] = json!(cached);
     Ok(())
 }
@@ -74,6 +86,23 @@ mod tests {
         let mut p=json!({"transfer_id":"abc","remote_engine_id":"P0"});
         attach_mooncake_prefill_usage(&response(json!(0)),&mut p).unwrap();
         assert_eq!(p,json!({"transfer_id":"abc","remote_engine_id":"P0","remote_prefill_cached_tokens":0}));
+    }
+    #[test]
+    fn forwards_verified_cache_creation_from_opted_in_prefills() {
+        for mut reply in [
+            json!({"usage":{"prompt_tokens":64,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":56}}}),
+            json!({"object":"response","usage":{"input_tokens":64,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":56}}}),
+            json!({"type":"message","usage":{"input_tokens":8,"cache_read_input_tokens":0,"cache_creation_input_tokens":56}}),
+        ] {
+            reply["model"] = json!("kimi-k3.1-pro");
+            let mut params = json!({});
+            attach_mooncake_prefill_usage(&reply, &mut params).unwrap();
+            assert_eq!(params["remote_prefill_cache_creation_tokens"], 56);
+            reply["model"] = json!("deepseek-v4.1-flash");
+            let mut ds = json!({});
+            attach_mooncake_prefill_usage(&reply, &mut ds).unwrap();
+            assert!(ds.get("remote_prefill_cache_creation_tokens").is_none());
+        }
     }
     #[test] fn warm_uses_exact_measured_count() {
         let mut p=json!({});attach_mooncake_prefill_usage(&response(json!(78400)),&mut p).unwrap();

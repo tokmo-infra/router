@@ -128,7 +128,7 @@ pub fn chat_to_generate_request(
         sampling: Some(pb::RandomSampling {
             num_sequences: request.n.unwrap_or(0),
             top_k: request.top_k.unwrap_or(0) as u32,
-            top_p: request.top_p.unwrap_or(0.0),
+            top_p: request.top_p.unwrap_or(0.0) as f32,
             min_p: request.min_p.unwrap_or(0.0),
             seed: request.seed,
         }),

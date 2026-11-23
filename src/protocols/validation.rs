@@ -555,7 +555,7 @@ impl SamplingOptionsProvider for ChatCompletionRequest {
         self.temperature
     }
     fn get_top_p(&self) -> Option<f32> {
-        self.top_p
+        self.top_p.map(|p| p as f32)
     }
     fn get_frequency_penalty(&self) -> Option<f32> {
         self.frequency_penalty
@@ -1002,7 +1002,7 @@ mod tests {
             assert!(request.validate().is_ok());
             request.top_p = Some(1.0);
             assert!(request.validate().is_ok());
-            request.top_p = Some(f32::EPSILON);
+            request.top_p = Some(f64::from(f32::EPSILON));
             assert!(request.validate().is_ok());
             request.top_p = Some(0.0);
             assert!(request.validate().is_err());

@@ -390,7 +390,7 @@ pub struct ChatCompletionRequest {
 
     /// An alternative to sampling with temperature
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
 
     /// How many chat completion choices to generate for each input message
     #[serde(skip_serializing_if = "Option::is_none")]
