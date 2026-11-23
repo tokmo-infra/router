@@ -1,6 +1,7 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
+use super::kimi_media::MediaPool;
 use super::token_balance::{TokenBalancer, Reservation as TokenReservation};
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
@@ -46,6 +47,7 @@ struct MooncakePrefillInfo {
 pub struct VllmPDRouter {
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    media_pool: Option<MediaPool>,
     response_history: Option<Arc<ResponseHistory>>,
     // Shared by all direct routes; never held across an await.
     decode_admission: parking_lot::Mutex<()>,
@@ -1178,7 +1180,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                if path == "/v1/responses" && prefill_status.is_client_error() {
+                if Self::forward_prefill_client_error(path, prefill_status) {
                     return Ok(Self::forward_upstream_response(prefill_response));
                 }
                 let error_body = prefill_response.text().await.unwrap_or_default();
@@ -1358,7 +1360,7 @@ impl VllmPDRouter {
                     RouterMetrics::record_pd_request_duration(path, duration);
                     RouterMetrics::record_pd_prefill_request(prefill_http);
                     let prefill_err = match failure {
-                        Ok(resp) if path == "/v1/responses" && resp.status().is_client_error() => {
+                        Ok(resp) if Self::forward_prefill_client_error(path, resp.status()) => {
                             return Ok(Self::forward_upstream_response(resp));
                         }
                         Ok(resp) => format!("Prefill request failed with status {}", resp.status()),
@@ -1606,7 +1608,7 @@ impl VllmPDRouter {
         );
 
         let prefill_status = prefill_response.status();
-        if path == "/v1/responses" && prefill_status.is_client_error() {
+        if Self::forward_prefill_client_error(path, prefill_status) {
             self.stop_profiling(&prefill_base_url).await;
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             RouterMetrics::record_pd_request(path);
@@ -1993,7 +1995,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                if path == "/v1/responses" && resp.status().is_client_error() {
+                if Self::forward_prefill_client_error(path, resp.status()) {
                     return Ok(Self::forward_upstream_response(resp));
                 }
                 return Err(PDRouterError::NetworkError {
@@ -2081,6 +2083,7 @@ impl VllmPDRouter {
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        let media_pool = MediaPool::from_env().await?;
         let kv_connector = ctx.router_config.kv_connector;
         let response_history = (matches!(kv_connector, KvConnector::Mooncake)
             && ctx.router_config.history_backend == crate::config::HistoryBackend::Memory)
@@ -2113,6 +2116,7 @@ impl VllmPDRouter {
 
             Ok(Self {
                 pd_router,
+                media_pool,
                 response_history,
                 service_registry: Arc::new(service_registry),
                 http_client,
@@ -2211,6 +2215,7 @@ impl VllmPDRouter {
 
             Ok(Self {
                 pd_router,
+                media_pool,
                 response_history,
                 service_registry: Arc::new(service_registry),
                 http_client,
@@ -2367,53 +2372,22 @@ impl RouterTrait for VllmPDRouter {
             self.use_discovery
         );
 
-        if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
-            info!("Using service discovery mode, processing vLLM two-stage request");
-
-            // Convert to generic request and use vLLM processing
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
-                .await
+        let mut request_json = match serde_json::to_value(body) {
+            Ok(value) => value,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {e}")).into_response(),
+        };
+        let media = if let Some(pool) = self.media_pool.as_ref().filter(|p| p.chat_request(&request_json)) {
+            match pool.prepare(&mut request_json).await {
+                Ok(stats) => Some(stats),
+                Err(response) => return response,
+            }
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PdRouterBase)
-            info!("Using direct URL mode with VllmPDRouter's own routing logic");
+            None
+        };
 
-            // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
+        let mut response = if self.use_discovery {
+            self.process_vllm_request(request_json, "/v1/chat/completions", headers).await
+        } else {
             // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
             let decode_workers = self.pd_router.worker_registry.get_decode_workers();
@@ -2500,7 +2474,11 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
             resp
+        };
+        if let (Some(pool), Some(stats)) = (&self.media_pool, media) {
+            pool.add_headers(&mut response, stats);
         }
+        response
     }
 
     async fn route_completion(
@@ -2748,10 +2726,21 @@ impl RouterTrait for VllmPDRouter {
             method, path
         );
 
-        if path == "/v1/messages/count_tokens" {
-            return self.count_message_tokens(headers, body).await;
-        }
         let mut request_json = body;
+        let image_pool = self.media_pool.as_ref().filter(|pool| pool.ds_request(&request_json) &&
+            matches!(path, "/v1/responses" | "/v1/messages" | "/v1/messages/count_tokens"));
+        // Store normalized Responses inputs so ID continuations reuse the same media bytes.
+        let media = if let Some(pool) = image_pool {
+            match pool.prepare(&mut request_json).await {
+                Ok(stats) => Some(stats),
+                Err(response) => return response,
+            }
+        } else { None };
+        if path == "/v1/messages/count_tokens" {
+            let mut response = self.count_message_tokens(headers, request_json).await;
+            if let (Some(pool), Some(stats)) = (image_pool, media) { pool.add_headers(&mut response, stats); }
+            return response;
+        }
         let turn = match (path, &self.response_history) {
             ("/v1/responses", Some(history)) => match history.prepare(headers, &mut request_json) {
                 Ok(turn) => turn,
@@ -2760,10 +2749,12 @@ impl RouterTrait for VllmPDRouter {
             _ => None,
         };
         let response = self.forward_pd(headers, path, request_json).await;
-        match turn {
+        let mut response = match turn {
             Some(turn) => turn.finish(response).await,
             None => response,
-        }
+        };
+        if let (Some(pool), Some(stats)) = (image_pool, media) { pool.add_headers(&mut response, stats); }
+        response
     }
 }
 
@@ -2817,6 +2808,10 @@ impl VllmPDRouter {
             Ok(upstream) => Self::forward_upstream_response(upstream),
             Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
         }
+    }
+
+    fn forward_prefill_client_error(path: &str, status: reqwest::StatusCode) -> bool {
+        matches!(path, "/v1/chat/completions" | "/v1/responses") && status.is_client_error()
     }
 
     fn forward_upstream_response(upstream: reqwest::Response) -> Response {

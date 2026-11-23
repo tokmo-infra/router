@@ -15,6 +15,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY wit ./wit
+COPY tokmo/ds41-inline-image/normalize.py ./tokmo/ds41-inline-image/normalize.py
+COPY tokmo/kimi31-inline-media/normalize.py ./tokmo/kimi31-inline-media/normalize.py
 
 # Build the Rust binary
 RUN cargo build --release
@@ -46,7 +48,12 @@ COPY README.md ./
 # msgpack/setuptools trip vulnerability scanners (GHSA-6v7p-g79w-8964,
 # CVE-2025-47273, CVE-2026-59890). Removing ensurepip also removes the
 # bundled pip wheel, which carries the same vendored copies.
-RUN pip3 install --no-cache-dir requests \
+ARG INSTALL_K31_MEDIA=0
+ARG INSTALL_DS41_IMAGE=0
+COPY tokmo/kimi31-inline-media/media-requirements.txt /tmp/k31-media-requirements.txt
+RUN if [ "$INSTALL_K31_MEDIA" = "1" ]; then pip3 install --no-cache-dir -r /tmp/k31-media-requirements.txt; fi \
+    && if [ "$INSTALL_DS41_IMAGE" = "1" ]; then pip3 install --no-cache-dir "Pillow==13.0.0"; fi \
+    && pip3 install --no-cache-dir requests \
     && pip3 uninstall -y pip \
     && rm -rf /usr/local/lib/python3.12/ensurepip
 

@@ -112,8 +112,8 @@ portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
-# Per-process CPU and RSS accounting for the router overhead harness.
-[target.'cfg(unix)'.dev-dependencies]
+# Kill the router-owned media process group on cancellation.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bench]]

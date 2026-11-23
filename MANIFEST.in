@@ -4,3 +4,6 @@ include Cargo.lock        # Locked Rust dependency graph for reproducible builds
 recursive-include src *.rs  # Rust source files
 # Required by wasmtime::component::bindgen!({ path: "wit", ... }) in src/wasm_middleware.rs
 recursive-include wit *
+
+include tokmo/kimi31-inline-media/normalize.py
+include tokmo/ds41-inline-image/normalize.py
