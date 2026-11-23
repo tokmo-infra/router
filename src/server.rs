@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -122,15 +122,22 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     let method = req.method().clone();
 
     // Read body
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let body = if path == "/v1/messages" {
+        // Use the same configured extractor limit for fixed and streamed bodies.
+        axum::body::Bytes::from_request(req, &state)
+            .await
+            .map_err(|e| e.into_response())
+    } else {
+        axum::body::to_bytes(req.into_body(), usize::MAX)
+            .await
+            .map_err(|e| {
+                (StatusCode::BAD_REQUEST, format!("Failed to read request body: {e}"))
+                    .into_response()
+            })
+    };
+    let body_bytes = match body {
         Ok(bytes) => bytes,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read request body: {}", e),
-            )
-                .into_response()
-        }
+        Err(response) => return response,
     };
 
     // Parse body as JSON
@@ -821,6 +828,12 @@ pub fn build_app_with_wasm_middleware(
         ));
     }
 
+    if enable_transparent_proxy {
+        protected_routes = protected_routes.route(
+            "/v1/messages",
+            axum::routing::any(transparent_proxy_handler),
+        );
+    }
     let protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
         app_state.clone(),
         middleware::concurrency_limit_middleware,
@@ -861,17 +874,6 @@ pub fn build_app_with_wasm_middleware(
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ));
-
-    // Messages uses the transparent handler, but is a first-class inference
-    // endpoint for response request IDs and tracing just like Chat and Responses.
-    let base_app = if enable_transparent_proxy {
-        base_app.route(
-            "/v1/messages",
-            axum::routing::any(transparent_proxy_handler),
-        )
-    } else {
-        base_app
-    };
 
     let base_app = if enable_request_tracing {
         base_app.layer(middleware::create_logging_layer())

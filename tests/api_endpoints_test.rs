@@ -137,6 +137,35 @@ impl TestContext {
     }
 }
 
+#[tokio::test]
+async fn messages_obeys_inference_admission_and_body_limits() {
+    let mut ctx = TestContext::new(vec![]).await;
+    ctx.config.max_payload_size = 32;
+    let app = ctx.create_app().await;
+    let request = Request::post("/v1/messages")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"01234567890123456789")),
+            Ok(axum::body::Bytes::from_static(b"01234567890123456789")),
+        ])))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(response.headers().contains_key("x-request-id"));
+
+    ctx.config.max_concurrent_requests = 0;
+    let app = ctx.create_app().await;
+    for path in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
+        let request = Request::post(path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key("x-request-id"));
+    }
+}
+
 #[cfg(test)]
 mod health_tests {
     use super::*;
