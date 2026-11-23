@@ -610,10 +610,12 @@ impl VllmPDRouter {
     /// Generate vLLM-specific request ID with prefill/decode addressing
     fn generate_vllm_request_id(prefill_addr: &str, decode_addr: &str) -> String {
         let uuid = Uuid::new_v4().to_string().replace('-', "");
-        format!(
+        let id = format!(
             "___prefill_addr_{}___decode_addr_{}_{}",
             prefill_addr, decode_addr, uuid
-        )
+        );
+        debug!(target: "pd_request_ids", worker_request_id = %id, "P/D dispatch");
+        id
     }
 
     /// Get ZMQ address for a worker URL using service discovery
@@ -2811,7 +2813,10 @@ impl VllmPDRouter {
     }
 
     fn forward_prefill_client_error(path: &str, status: reqwest::StatusCode) -> bool {
-        matches!(path, "/v1/chat/completions" | "/v1/responses") && status.is_client_error()
+        matches!(
+            path,
+            "/v1/chat/completions" | "/v1/responses" | "/v1/messages"
+        ) && status.is_client_error()
     }
 
     fn forward_upstream_response(upstream: reqwest::Response) -> Response {
@@ -2943,6 +2948,20 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn messages_forwards_prefill_client_errors() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::NOT_FOUND] {
+            assert!(VllmPDRouter::forward_prefill_client_error(
+                "/v1/messages",
+                status
+            ));
+        }
+        assert!(!VllmPDRouter::forward_prefill_client_error(
+            "/v1/messages",
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
 
     fn reserved_test_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode))

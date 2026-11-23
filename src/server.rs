@@ -862,6 +862,17 @@ pub fn build_app_with_wasm_middleware(
             max_payload_size,
         ));
 
+    // Messages uses the transparent handler, but is a first-class inference
+    // endpoint for response request IDs and tracing just like Chat and Responses.
+    let base_app = if enable_transparent_proxy {
+        base_app.route(
+            "/v1/messages",
+            axum::routing::any(transparent_proxy_handler),
+        )
+    } else {
+        base_app
+    };
+
     let base_app = if enable_request_tracing {
         base_app.layer(middleware::create_logging_layer())
     } else {

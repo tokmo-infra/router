@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
-use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
@@ -118,11 +118,30 @@ where
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
-        // Call the inner service
+        let trace_pd = tracing::enabled!(target: "pd_request_ids", tracing::Level::DEBUG)
+            && matches!(
+                req.uri().path(),
+                "/v1/chat/completions" | "/v1/responses" | "/v1/messages"
+            );
         let future = self.inner.call(req);
 
         Box::pin(async move {
-            let mut response = future.await?;
+            let mut response = if trace_pd {
+                let span = tracing::debug_span!(
+                    target: "pd_request_ids", "inference", request_id = %request_id
+                );
+                async {
+                    let response = future.await?;
+                    if !response.status().is_success() {
+                        debug!(target: "pd_request_ids", status = %response.status(), "request failed");
+                    }
+                    Ok::<_, S::Error>(response)
+                }
+                .instrument(span)
+                .await?
+            } else {
+                future.await?
+            };
 
             // Add request ID to response headers
             response.headers_mut().insert(
