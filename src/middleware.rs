@@ -115,8 +115,11 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
-        // Insert request ID into request extensions for other middleware/handlers to use
-        req.extensions_mut().insert(RequestId(request_id.clone()));
+        let is_messages = matches!(req.uri().path(), "/v1/messages" | "/v1/messages/count_tokens");
+        let request_id_header = HeaderValue::from_str(&request_id)
+            .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id"));
+        req.headers_mut().insert("x-router-request-id", request_id_header.clone());
+        req.extensions_mut().insert(RequestId(request_id));
 
         // Call the inner service
         let future = self.inner.call(req);
@@ -124,12 +127,10 @@ where
         Box::pin(async move {
             let mut response = future.await?;
 
-            // Add request ID to response headers
-            response.headers_mut().insert(
-                "x-request-id",
-                HeaderValue::from_str(&request_id)
-                    .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
-            );
+            response.headers_mut().insert("x-request-id", request_id_header.clone());
+            if is_messages {
+                response.headers_mut().insert("request-id", request_id_header);
+            }
 
             Ok(response)
         })

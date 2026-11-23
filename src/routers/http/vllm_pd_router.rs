@@ -1,6 +1,7 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::dp_utils;
+use super::glm_media::GlmMedia;
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
@@ -44,6 +45,7 @@ struct MooncakePrefillInfo {
 pub struct VllmPDRouter {
     /// Underlying PD router for most functionality
     pd_router: PdRouterBase,
+    media: GlmMedia,
     // Shared by all direct routes; never held across an await.
     decode_admission: parking_lot::Mutex<()>,
     prefill_admission: parking_lot::Mutex<()>,
@@ -177,15 +179,72 @@ fn build_prefill_request_builder(
     dp_utils::add_dp_rank_header(builder, dp_rank)
 }
 
-// Pydantic errors can include the original prompt or image data. Return the
-// parameter error without copying input values or private worker addresses.
-fn input_rejection(path: &str, status: StatusCode) -> Option<Response> {
-    if !matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY) {
-        return None;
+fn is_prefill_validation_error(status: StatusCode) -> bool {
+    matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::PAYLOAD_TOO_LARGE
+        | StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::UNPROCESSABLE_ENTITY)
+}
+
+// Pydantic can include the prompt or raw media in both input and message.
+// Preserve the status and recognized field, never upstream free text or headers.
+async fn prefill_validation_error(path: &str, mut upstream: reqwest::Response) -> Response {
+    const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+    let status = upstream.status();
+    let diagnostic = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut body = Vec::new();
+        while let Some(chunk) = upstream.chunk().await.ok()? {
+            if chunk.len() > MAX_DIAGNOSTIC_BYTES - body.len() {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice::<Value>(&body).ok()
+    }).await.ok().flatten();
+    if status == StatusCode::NOT_FOUND {
+        let model_missing = diagnostic.as_ref().is_some_and(|body| {
+            let error = &body["error"];
+            error["code"] == "model_not_found"
+                || error["param"] == "model"
+                || (matches!(error["type"].as_str(), Some("NotFoundError" | "not_found_error"))
+                    && error["message"].as_str().is_some_and(|msg| {
+                        (msg.starts_with("The model ") && msg.contains(" does not exist."))
+                            || msg == "The requested model does not exist."
+                    }))
+        });
+        let messages = path.starts_with("/v1/messages");
+        let (status, kind, message) = if model_missing {
+            (StatusCode::NOT_FOUND, if messages { "not_found_error" } else { "invalid_request_error" }, "The requested model does not exist.")
+        } else {
+            (StatusCode::BAD_GATEWAY, if messages { "api_error" } else { "server_error" }, "The prefill endpoint is unavailable.")
+        };
+        let mut body = json!({"error": {"type": kind, "message": message}});
+        if messages {
+            body["type"] = json!("error");
+        } else if model_missing {
+            body["error"]["code"] = json!("model_not_found");
+            body["error"]["param"] = json!("model");
+        }
+        return (status, axum::Json(body)).into_response();
     }
-    let mut body = json!({"error": {"type": "invalid_request_error", "message": "Invalid request parameters for this endpoint."}});
-    if path.starts_with("/v1/messages") { body["type"] = json!("error"); }
-    Some((status, axum::Json(body)).into_response())
+    let mut body = json!({"error": {"type": "invalid_request_error", "message": "Prefill rejected the request parameters."}});
+    if path.starts_with("/v1/messages") {
+        body["type"] = json!("error");
+    } else if let Some(field) = diagnostic.as_ref().and_then(validation_field) {
+        body["error"]["param"] = json!(field);
+    }
+    (status, axum::Json(body)).into_response()
+}
+
+fn validation_field(value: &Value) -> Option<&str> {
+    fn known(field: &str) -> bool {
+        matches!(field, "messages" | "input" | "tools" | "tool_choice" | "model"
+            | "temperature" | "top_p" | "max_tokens" | "max_completion_tokens"
+            | "max_output_tokens" | "image_url" | "image" | "response_format")
+    }
+    value.pointer("/error/param").or_else(|| value.get("param"))
+        .and_then(Value::as_str).filter(|field| known(field))
+        .or_else(|| value["detail"].as_array()?.iter().find_map(|item| {
+            item["loc"].as_array()?.iter().filter_map(Value::as_str).find(|field| known(field))
+        }))
 }
 
 fn reject_stateful_responses(path: &str, body: &Value) -> Option<Response> {
@@ -249,12 +308,12 @@ impl VllmPDRouter {
         let url = format!("{base}{path}");
         let mut req = match count { Some(v) => self.pd_router.client.post(url).json(v), None => self.pd_router.client.get(url) };
         if let Ok(key) = std::env::var("OPENAI_API_KEY") { if !key.is_empty() { req = req.bearer_auth(key); } }
-        for name in ["anthropic-version", "anthropic-beta"] {
+        for name in ["anthropic-version", "anthropic-beta", "x-router-request-id"] {
             if let Some(value) = headers.get(name) { req = req.header(name, value); }
         }
         let Ok(res) = req.send().await else { return StatusCode::BAD_GATEWAY.into_response(); };
         let status = res.status();
-        if let Some(err) = input_rejection(path, status) { return err; }
+        if is_prefill_validation_error(status) { return prefill_validation_error(path, res).await; }
         if !status.is_success() { return StatusCode::BAD_GATEWAY.into_response(); }
         match res.json::<Value>().await { Ok(v) => (status, axum::Json(v)).into_response(), Err(_) => StatusCode::BAD_GATEWAY.into_response() }
     }
@@ -1225,16 +1284,14 @@ impl VllmPDRouter {
             debug!("Prefill server responded with status: {}", prefill_status);
 
             if !prefill_status.is_success() {
-                if let Some(err) = input_rejection(path, prefill_status) { return Ok(err); }
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(prefill_http);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, duration);
-                let error_body = prefill_response.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Prefill server error {}: {}",
-                    prefill_status, error_body
-                ));
+                if is_prefill_validation_error(prefill_status) {
+                    return Ok(prefill_validation_error(path, prefill_response).await);
+                }
+                return Err(format!("Prefill server error {prefill_status}"));
             }
 
             // Extract kv_transfer_params from prefill response
@@ -1337,6 +1394,11 @@ impl VllmPDRouter {
             let enable_profiling = self.enable_profiling;
             let profiling_tasks = &self.profiling_tasks;
             let pd_router = &self.pd_router;
+            enum PrefillOutcome {
+                Complete(Option<Value>),
+                Rejected(reqwest::Response),
+                Transport(reqwest::Error),
+            }
             let prefill_fut = async move {
                 let result = otel_http::send_client_request(
                     build_prefill_request_builder(
@@ -1365,36 +1427,10 @@ impl VllmPDRouter {
                 }
                 match result {
                     Ok(resp) if resp.status().is_success() => {
-                        let status = resp.status();
-                        match resp.bytes().await {
-                            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                                Ok(json) => {
-                                    debug!("Concurrent prefill completed with status {}", status);
-                                    Ok(Some(json))
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        "Concurrent prefill completed with status {} (non-JSON body)",
-                                        status
-                                    );
-                                    Ok(None)
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Concurrent prefill: failed to read response body: {}", e);
-                                Ok(None)
-                            }
-                        }
+                        PrefillOutcome::Complete(resp.json::<Value>().await.ok())
                     }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        warn!("Concurrent prefill returned non-2xx status: {}", status);
-                        Err(format!("Prefill request failed with status {}", status))
-                    }
-                    Err(e) => {
-                        warn!("Concurrent prefill request failed: {}", e);
-                        Err(format!("Prefill request failed: {}", e))
-                    }
+                    Ok(resp) => PrefillOutcome::Rejected(resp),
+                    Err(err) => PrefillOutcome::Transport(err),
                 }
             };
             let decode_fut = otel_http::send_client_request(
@@ -1408,21 +1444,23 @@ impl VllmPDRouter {
                 },
             );
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
-            let concurrent_prefill_response_json: Option<Value> = match prefill_result {
-                Err(prefill_err) => {
-                    self.stop_profiling(&format!("http://{}", decode_base_http))
-                        .await;
-                    let duration = start_time.elapsed();
+            let concurrent_prefill_response_json = match prefill_result {
+                PrefillOutcome::Complete(json) => json,
+                failure => {
+                    self.stop_profiling(&format!("http://{}", decode_base_http)).await;
                     RouterMetrics::record_pd_prefill_error(prefill_http);
                     RouterMetrics::record_pd_request(path);
-                    RouterMetrics::record_pd_request_duration(path, duration);
+                    RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
                     RouterMetrics::record_pd_prefill_request(prefill_http);
-                    return Err(format!(
-                        "Prefill request failed to {}: {}",
-                        prefill_http, prefill_err
-                    ));
+                    match failure {
+                        PrefillOutcome::Rejected(resp) if is_prefill_validation_error(resp.status()) => {
+                            return Ok(prefill_validation_error(path, resp).await);
+                        }
+                        PrefillOutcome::Rejected(resp) => return Err(format!("Prefill request failed with status {}", resp.status())),
+                        PrefillOutcome::Transport(err) => return Err(format!("Prefill request failed to {prefill_http}: {err}")),
+                        PrefillOutcome::Complete(_) => unreachable!("handled above"),
+                    }
                 }
-                Ok(json) => json,
             };
             if let Some(prefill_json) = concurrent_prefill_response_json.as_ref() {
                 self.maybe_cache_nixl_push_identity(
@@ -1599,10 +1637,6 @@ impl VllmPDRouter {
                 request_id
             );
         }
-        debug!(
-            "📤 Prefill request payload: {}",
-            serde_json::to_string_pretty(&prefill_request).unwrap_or_default()
-        );
 
         // Start profiling on prefill server
         self.start_profiling(&prefill_base_url).await;
@@ -1657,7 +1691,13 @@ impl VllmPDRouter {
         );
 
         let prefill_status = prefill_response.status();
-        if let Some(err) = input_rejection(path, prefill_status) { return Ok(err); }
+        if is_prefill_validation_error(prefill_status) {
+            self.stop_profiling(&prefill_base_url).await;
+            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+            return Ok(prefill_validation_error(path, prefill_response).await);
+        }
         // Extract prefill response body to get kv_transfer_params
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1769,10 +1809,6 @@ impl VllmPDRouter {
                 request_id
             );
         }
-        debug!(
-            "📤 Decode request payload: {}",
-            serde_json::to_string_pretty(&decode_request).unwrap_or_default()
-        );
 
         // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
@@ -2037,6 +2073,9 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                if is_prefill_validation_error(resp.status()) {
+                    return Ok(prefill_validation_error(path, resp).await);
+                }
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Prefill request failed to {} with status {}",
@@ -2122,6 +2161,7 @@ impl VllmPDRouter {
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        let media = GlmMedia::from_env()?;
         let kv_connector = ctx.router_config.kv_connector;
         let http_client = reqwest::Client::new();
 
@@ -2151,6 +2191,7 @@ impl VllmPDRouter {
 
             Ok(Self {
                 pd_router,
+                media,
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2243,6 +2284,7 @@ impl VllmPDRouter {
 
             Ok(Self {
                 pd_router,
+                media,
                 service_registry: Arc::new(service_registry),
                 http_client,
                 policy_registry: ctx.policy_registry.clone(),
@@ -2401,53 +2443,18 @@ impl RouterTrait for VllmPDRouter {
             self.use_discovery
         );
 
+        let request_json = match serde_json::to_value(body) {
+            Ok(json) => json,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {e}")).into_response(),
+        };
+        let request_json = match self.media.prepare("/v1/chat/completions", request_json).await {
+            Ok(json) => json,
+            Err(response) => return response,
+        };
+
         if self.use_discovery {
-            // Discovery mode - use vLLM-specific two-stage processing
-            info!("Using service discovery mode, processing vLLM two-stage request");
-
-            // Convert to generic request and use vLLM processing
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
-            // Process vLLM two-stage request with service discovery
-            self.process_vllm_request(request_json, "/v1/chat/completions", headers)
-                .await
+            self.process_vllm_request(request_json, "/v1/chat/completions", headers).await
         } else {
-            // Direct URL mode - implement routing logic here (not delegating to PdRouterBase)
-            info!("Using direct URL mode with VllmPDRouter's own routing logic");
-
-            // Convert request to JSON
-            let request_json = match serde_json::to_value(body) {
-                Ok(json) => {
-                    debug!(
-                        "Serialized chat request: {}",
-                        serde_json::to_string_pretty(&json).unwrap_or_default()
-                    );
-                    json
-                }
-                Err(e) => {
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response()
-                }
-            };
-
             // Get prefill and decode workers from worker_registry
             let prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
             let decode_workers = self.pd_router.worker_registry.get_decode_workers();
@@ -2788,6 +2795,11 @@ impl RouterTrait for VllmPDRouter {
                 "message": message,
             }}))).into_response();
         }
+
+        body = match self.media.prepare(path, body).await {
+            Ok(json) => json,
+            Err(response) => return response,
+        };
 
         debug!(
             "Transparent proxy: routing {} {} through P/D pipeline",

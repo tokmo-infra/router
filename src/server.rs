@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -32,7 +32,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -41,7 +40,6 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     signal, spawn,
-    sync::RwLock,
 };
 use tracing::{error, info, warn, Level};
 
@@ -54,7 +52,7 @@ pub struct AppContext {
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
-    pub api_key_cache: Arc<RwLock<HashMap<String, bool>>>,
+    pub(crate) auth_client: Client,
     pub api_key_validation_urls: Arc<Vec<String>>,
 }
 
@@ -88,7 +86,11 @@ impl AppContext {
             policy_registry,
             router_manager,
             response_storage,
-            api_key_cache: Arc::new(RwLock::new(HashMap::new())),
+            auth_client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(3))
+                .build()
+                .map_err(|err| format!("Could not create validation client: {err}"))?,
             api_key_validation_urls: Arc::new(api_key_validation_urls),
         })
     }
@@ -249,15 +251,86 @@ async fn inference_generate(
         .await
 }
 
+async fn inference_admission_error_format(
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let messages = matches!(request.uri().path(), "/v1/messages" | "/v1/messages/count_tokens");
+    let infer = messages || matches!(request.uri().path(), "/v1/chat/completions" | "/v1/responses");
+    let request_id = request.extensions().get::<middleware::RequestId>().cloned();
+    let response = next.run(request).await;
+    if !infer || response.headers().get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json")) {
+        return response;
+    }
+    let (kind, message) = match response.status() {
+        StatusCode::UNAUTHORIZED => ("authentication_error", "Missing or invalid API key."),
+        StatusCode::FORBIDDEN => ("permission_error", "The request is not permitted."),
+        StatusCode::SERVICE_UNAVAILABLE => ("api_error", "The service is temporarily unavailable."),
+        StatusCode::REQUEST_TIMEOUT => ("timeout_error", "The request timed out."),
+        StatusCode::PAYLOAD_TOO_LARGE => ("request_too_large", "Request body exceeds the configured limit."),
+        StatusCode::TOO_MANY_REQUESTS => ("rate_limit_error", "The server has no available request capacity."),
+        _ => return response,
+    };
+    let mut body = json!({"error": {"type": kind, "message": message}});
+    if messages {
+        body["type"] = json!("error");
+        if let Some(request_id) = request_id {
+            body["request_id"] = json!(request_id.0);
+        }
+    }
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    parts.headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    Response::from_parts(parts, axum::body::Body::from(body.to_string()))
+}
+
+fn inference_json_error(error: JsonRejection, messages: bool) -> Response {
+    let status = match error.status() {
+        StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
+        status => status,
+    };
+    let message = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "Request body exceeds the configured limit.",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "Expected a JSON request body (Content-Type: application/json).",
+        _ => "Invalid JSON request body or request fields.",
+    };
+    let mut body = json!({"error": {"type": if messages && status == StatusCode::PAYLOAD_TOO_LARGE { "request_too_large" } else { "invalid_request_error" }, "message": message}});
+    if messages {
+        body["type"] = json!("error");
+    }
+    (status, Json(body)).into_response()
+}
+
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    uri: http::Uri,
+    headers: http::HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error) => return inference_json_error(error, true),
+    };
+    state.router.route_transparent(Some(&headers), uri.path(), &http::Method::POST, body).await
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    body: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error) => return inference_json_error(error, false),
+    };
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
@@ -306,12 +379,16 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error) => return inference_json_error(error, false),
+    };
     state
         .router
         .route_transparent(Some(&headers), "/v1/responses", &http::Method::POST, body)
@@ -396,7 +473,7 @@ async fn v1_responses_list_input_items(
 }
 
 const AUTH_FAILURE_MESSAGE: &str =
-    "You must provide a valid API key. Obtain one from http://helmholtz.cloud";
+    "Missing or invalid API key.";
 
 // ---------- Worker management endpoints (Legacy) ----------
 
@@ -425,45 +502,18 @@ async fn authorize_request(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response())?;
 
-    if let Some(valid) = state.context.api_key_cache.read().await.get(token).copied() {
-        if valid {
-            return Ok(());
-        }
-        return Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response());
-    }
-
-    let mut validated = false;
+    // The identity service owns expiry and revocation. Recheck on admission
+    // rather than retaining raw bearer tokens or prior decisions indefinitely.
+    let mut unavailable = false;
     for url in validation_urls {
-        match state
-            .context
-            .client
-            .get(url)
-            .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-        {
-            Ok(response) if response.status() == StatusCode::OK => {
-                validated = true;
-                break;
-            }
-            Ok(_) => {
-                continue;
-            }
-            Err(err) => {
-                warn!("Failed to validate API key against {url}: {err}");
-            }
+        match state.context.auth_client.get(url).bearer_auth(token).send().await {
+            Ok(response) if response.status() == StatusCode::OK => return Ok(()),
+            Ok(response) if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => (),
+            _ => unavailable = true,
         }
     }
-
-    state
-        .context
-        .api_key_cache
-        .write()
-        .await
-        .insert(token.to_string(), validated);
-
-    if validated {
-        Ok(())
+    if unavailable {
+        Err((StatusCode::SERVICE_UNAVAILABLE, "Authentication service unavailable.").into_response())
     } else {
         Err((StatusCode::UNAUTHORIZED, AUTH_FAILURE_MESSAGE).into_response())
     }
@@ -791,6 +841,12 @@ pub fn build_app_with_wasm_middleware(
             get(v1_responses_list_input_items),
         );
 
+    if enable_transparent_proxy {
+        protected_routes = protected_routes
+            .route("/v1/messages", post(v1_messages))
+            .route("/v1/messages/count_tokens", post(v1_messages));
+    }
+
     if let Some(runtime) = wasm_runtime {
         protected_routes = protected_routes.route_layer(axum::middleware::from_fn_with_state(
             crate::wasm_middleware::WasmRouteMiddlewareState {
@@ -840,7 +896,8 @@ pub fn build_app_with_wasm_middleware(
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
-        ));
+        ))
+        .layer(axum::middleware::from_fn(inference_admission_error_format));
 
     let base_app = if enable_request_tracing {
         base_app.layer(middleware::create_logging_layer())

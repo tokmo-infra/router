@@ -118,14 +118,15 @@ impl<'de> Deserialize<'de> for ChatMessage {
             .as_str()
             .ok_or_else(|| D::Error::custom("role field must be a string"))?;
 
+        let parse_content = |content: &Value| {
+            serde_json::from_value(content.clone())
+                .map_err(|_| D::Error::custom("invalid chat message content"))
+        };
+
         match role {
             "assistant" => Ok(ChatMessage::Assistant {
                 role: role.to_string(),
-                content: value.get("content").and_then(|content| {
-                    (!content.is_null())
-                        .then(|| serde_json::from_value(content.clone()).ok())
-                        .flatten()
-                }),
+                content: value.get("content").filter(|value| !value.is_null()).map(parse_content).transpose()?,
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -159,10 +160,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|content| serde_json::from_value(content.clone()).ok())
-                    .unwrap_or(UserMessageContent::Text(String::new())),
+                content: parse_content(value.get("content").ok_or_else(|| D::Error::missing_field("content"))?)?,
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -172,13 +170,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }),
             }),
             "user" => {
-                let content = value
-                    .get("content")
-                    .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
-                    })
-                    .unwrap_or(UserMessageContent::Text(String::new()));
+                let content = parse_content(value.get("content").ok_or_else(|| D::Error::missing_field("content"))?)?;
                 Ok(ChatMessage::User {
                     role: role.to_string(),
                     content,
@@ -295,6 +287,12 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    // Preserve Chat video fields (including uuid) for admission before P/D.
+    #[serde(rename = "video_url")]
+    VideoUrl {
+        #[serde(flatten)]
+        fields: std::collections::BTreeMap<String, Value>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

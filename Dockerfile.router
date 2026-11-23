@@ -27,6 +27,10 @@ RUN cargo build --release --locked -j "$CARGO_BUILD_JOBS"
 
 # Python stage with Rust binary
 FROM ${ROUTER_RUNTIME_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && ffprobe -hide_banner -version >/dev/null \
+    && ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw libx264
 
 # Create app directory
 WORKDIR /app

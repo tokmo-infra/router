@@ -137,6 +137,40 @@ impl TestContext {
     }
 }
 
+#[tokio::test]
+async fn messages_obeys_shared_admission_limits_with_request_id() {
+    let mut ctx = TestContext::new(vec![]).await;
+    ctx.config.max_payload_size = 32;
+    let app = ctx.create_app().await;
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        for body in [
+            Body::from("0123456789012345678901234567890123456789"),
+            Body::from_stream(futures::stream::iter([
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"01234567890123456789")),
+                Ok(axum::body::Bytes::from_static(b"01234567890123456789")),
+            ])),
+        ] {
+            let request = Request::post(path).header(CONTENT_TYPE, "application/json")
+                .header("x-request-id", "glm-test-413").body(body).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(response.headers()["request-id"], "glm-test-413");
+            assert_eq!(response.headers()["x-request-id"], "glm-test-413");
+        }
+    }
+
+    ctx.config.max_concurrent_requests = 0;
+    let app = ctx.create_app().await;
+    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"] {
+        let request = Request::post(path).header(CONTENT_TYPE, "application/json")
+            .header("x-request-id", "glm-test-429").body(Body::from("{}")).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-request-id"], "glm-test-429");
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    }
+}
+
 #[cfg(test)]
 mod health_tests {
     use super::*;
