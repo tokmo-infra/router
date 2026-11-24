@@ -195,7 +195,7 @@ impl MediaPool {
     pub(super) fn ds_request(&self, body: &Value) -> bool {
         self.deepseek
             && match body["model"].as_str() {
-                Some(name) => name == "deepseek-v4.1-flash-1017",
+                Some(name) => crate::protocols::spec::is_ds41_flash(name),
                 None => self.default_ds_model && body["model"].is_null(),
             }
     }

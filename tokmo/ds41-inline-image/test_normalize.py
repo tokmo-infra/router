@@ -44,6 +44,13 @@ class ImagePolicyTest(unittest.TestCase):
         img = Image.open(io.BytesIO(base64.b64decode(messages["source"]["data"])))
         self.assertEqual(img.getpixel((0, 0)), (255, 0, 0, 127))
 
+    def test_source_limit_applies_before_reencoding(self):
+        raw = fixture(128, 128)
+        limit = 32 * 1024**2
+        self.assertIsNotNone(normalize(blocks(padding(raw, limit))[0])[0])
+        with self.assertRaisesRegex(ValueError, "32 MiB"):
+            normalize(blocks(padding(raw, limit + 1))[0])
+
     def test_ds_budget(self):
         for shape in ((4032, 3024), (1, 10000), (10000, 1), (1, 1), (999, 321), (16384, 8)):
             with self.subTest(shape=shape):

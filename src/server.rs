@@ -153,6 +153,11 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
         }
     };
 
+    if matches!(path.as_str(), "/v1/messages" | "/v1/messages/count_tokens") {
+        if let Some(error) = ds41_body_limit(body_bytes.len(), body_json["model"].as_str()) {
+            return error;
+        }
+    }
     // Route through transparent proxy
     state
         .router
@@ -285,21 +290,42 @@ fn kimi_media_shorthand(bytes: &[u8]) -> Option<ChatCompletionRequest> {
     serde_json::from_value(body).ok()
 }
 
+const DS41_BODY_LIMIT: usize = 48 * 1024 * 1024;
+
+fn ds41_body_limit(size: usize, model: Option<&str>) -> Option<Response> {
+    if size <= DS41_BODY_LIMIT {
+        return None;
+    }
+    let configured = std::env::var("VLLM_ROUTER_DS41_IMAGE_DEFAULT_MODEL").ok();
+    if !model.or(configured.as_deref()).is_some_and(crate::protocols::spec::is_ds41_flash) {
+        return None;
+    }
+    Some((StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": {
+        "type": "invalid_request_error", "message": "Request body exceeds 48 MiB"
+    }}))).into_response())
+}
+
+// Preserve Axum's content-type and global size checks when a handler also needs the wire length.
+async fn buffered_json_request(req: Request, state: &Arc<AppState>) -> Result<(axum::body::Bytes, Request), Response> {
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), state)
+        .await.map_err(|error| error.into_response())?;
+    let request = Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
+    Ok((bytes, request))
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> Response {
-    let (parts, body) = req.into_parts();
-    if let Err(response) = authorize_request(&state, &parts.headers).await {
+    let headers = req.headers().clone();
+    if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
-    let headers = parts.headers.clone();
-    // Keep Axum's content-type check, body limits and typed JSON errors.
-    let bytes = match axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), &state).await {
-        Ok(bytes) => bytes,
-        Err(error) => return error.into_response(),
+    let (bytes, request) = match buffered_json_request(req, &state).await {
+        Ok(parts) => parts,
+        Err(error) => return error,
     };
-    let request = Request::from_parts(parts, axum::body::Body::from(bytes.clone()));
     let body = match Json::<ChatCompletionRequest>::from_request(request, &state).await {
         Ok(Json(body)) => body,
         Err(error @ axum::extract::rejection::JsonRejection::JsonDataError(_)) => {
@@ -316,6 +342,10 @@ async fn v1_chat_completions(
         }
         Err(error) => return error.into_response(),
     };
+    if let Some(error) = ds41_body_limit(bytes.len(), body.model.as_deref()) {
+        return error;
+    }
+    drop(bytes);
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
@@ -363,12 +393,24 @@ async fn v1_rerank(
 
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(mut body): Json<serde_json::Value>,
+    req: Request,
 ) -> Response {
+    let headers = req.headers().clone();
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
+    let (bytes, request) = match buffered_json_request(req, &state).await {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    let Json(mut body) = match Json::<serde_json::Value>::from_request(request, &state).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    if let Some(error) = ds41_body_limit(bytes.len(), body["model"].as_str()) {
+        return error;
+    }
+    drop(bytes);
     if let Err((param, message)) = crate::protocols::responses_compat::normalize(&mut body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1303,6 +1345,16 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ds41_body_limit_is_model_scoped_and_inclusive() {
+        for alias in ["deepseek-v4.1-flash-1017", "DeepSeek-v4.1-Flash", "Deepseek-4.1-Flash"] {
+            assert!(ds41_body_limit(DS41_BODY_LIMIT, Some(alias)).is_none());
+            assert_eq!(ds41_body_limit(DS41_BODY_LIMIT + 1, Some(alias)).unwrap().status(),
+                StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        assert!(ds41_body_limit(DS41_BODY_LIMIT + 1, Some("kimi-k3.1-pro")).is_none());
+    }
 
     #[test]
     fn kimi_chat_preserves_media_urls_and_fixed_top_p_on_the_wire() {

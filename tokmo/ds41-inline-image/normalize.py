@@ -10,7 +10,9 @@ import sys
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 FILE_LIMIT = 4 * 1024**2
-MAX_INPUT_BYTES = 256 * 1024**2
+MAX_INPUT_BYTES = 32 * 1024**2
+# The worker receives a group of images, including restored Responses history.
+MAX_FRAME_BYTES = 4 * math.ceil(256 * 1024**2 / 3) + 1024**2
 MAX_PIXELS = 64 * 1024**2
 TOKEN_LIMIT = 1024
 PATCH = 14
@@ -75,10 +77,12 @@ def normalize(part):
     if mime not in FORMATS:
         raise ValueError("Unsupported DS image type")
     if len(data) > 4 * math.ceil(MAX_INPUT_BYTES / 3):
-        raise ValueError("Image exceeds source byte budget")
+        raise ValueError("Image exceeds the 32 MiB source limit")
     raw = base64.b64decode(data, validate=True)
-    if not raw or len(raw) > MAX_INPUT_BYTES:
-        raise ValueError("Invalid image length")
+    if len(raw) > MAX_INPUT_BYTES:
+        raise ValueError("Image exceeds the 32 MiB source limit")
+    if not raw:
+        raise ValueError("Empty image")
     with Image.open(io.BytesIO(raw)) as image:
         if image.format != FORMATS[mime] or image.width * image.height > MAX_PIXELS:
             raise ValueError("Image format or pixel budget mismatch")
@@ -116,7 +120,7 @@ def serve():
     writer.write(b"DS4\n"); writer.flush()
     while header := reader.read(4):
         length, = struct.unpack(">I", header)
-        if length > 4 * math.ceil(MAX_INPUT_BYTES / 3) + 1024**2:
+        if length > MAX_FRAME_BYTES:
             raise ValueError("Image frame exceeds budget")
         try:
             items = json.loads(reader.read(length))

@@ -373,6 +373,11 @@ pub struct FunctionCallDelta {
     pub arguments: Option<String>,
 }
 
+pub(crate) fn is_ds41_flash(name: &str) -> bool {
+    ["deepseek-v4.1-flash-1017", "deepseek-v4.1-flash", "deepseek-4.1-flash"]
+        .iter().any(|alias| name.eq_ignore_ascii_case(alias))
+}
+
 // ============= Request =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
