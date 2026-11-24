@@ -35,6 +35,21 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+fn set_k31_stream_usage_default(body: &mut Value) {
+    let Some(model) = body["model"].as_str().and_then(|name| name.rsplit('/').next()) else {
+        return;
+    };
+    if !["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"]
+        .iter()
+        .any(|name| model.eq_ignore_ascii_case(name))
+    {
+        return;
+    }
+    if body["stream"] == true && body["stream_options"]["include_usage"].is_null() {
+        body["stream_options"]["include_usage"] = Value::Bool(false);
+    }
+}
+
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
 struct MooncakePrefillInfo {
@@ -2378,6 +2393,7 @@ impl RouterTrait for VllmPDRouter {
             Ok(value) => value,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {e}")).into_response(),
         };
+        set_k31_stream_usage_default(&mut request_json);
         let media = if let Some(pool) = self.media_pool.as_ref().filter(|p| p.chat_request(&request_json)) {
             match pool.prepare(&mut request_json).await {
                 Ok(stats) => Some(stats),
@@ -2948,6 +2964,26 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn k31_chat_defaults_usage_and_forwards_reasoning_effort() {
+        for effort in ["low", "medium", "high", "max"] {
+            let mut body = json!({"model":"Kimi/KIMI-K3.1-PRO","stream":true,"reasoning_effort":effort});
+            set_k31_stream_usage_default(&mut body);
+            assert_eq!(body["stream_options"]["include_usage"], false);
+            assert_eq!(body["reasoning_effort"], effort);
+        }
+        for usage in [false, true] {
+            let mut body = json!({"model":"kimi-k3.1-pro","stream":true,"stream_options":{"include_usage":usage}});
+            let original = body.clone();
+            set_k31_stream_usage_default(&mut body);
+            assert_eq!(body, original);
+        }
+        let mut other = json!({"model":"deepseek-v4.1-flash","reasoning_effort":"medium","stream":true});
+        let original = other.clone();
+        set_k31_stream_usage_default(&mut other);
+        assert_eq!(other, original);
+    }
 
     #[test]
     fn messages_forwards_prefill_client_errors() {
