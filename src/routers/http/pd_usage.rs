@@ -58,6 +58,20 @@ pub fn attach_mooncake_prefill_usage(
         };
         let created = measured.as_u64().ok_or("missing or invalid measured P cache creation")?;
         params["remote_prefill_cache_creation_tokens"] = json!(created);
+        // Reuse only the lease metadata produced with this measured prefill.
+        let transfer = &prefill["kv_transfer_params"];
+        if let Some(limit) = transfer.get("k31_cache_read_limit") {
+            let limit = limit.as_u64().ok_or("invalid Kimi cache read limit")?;
+            let tiers = transfer["k31_cache_writes"].as_array().filter(|v| v.len() == 2)
+                .ok_or("missing Kimi cache write tiers")?;
+            let short = tiers[0].as_u64().ok_or("invalid Kimi 5m cache writes")?;
+            let long = tiers[1].as_u64().ok_or("invalid Kimi 1h cache writes")?;
+            if short.checked_add(long).is_none_or(|total| total > created) {
+                return Err("Kimi cache write tiers exceed measured total");
+            }
+            params["k31_cache_read_limit"] = json!(limit);
+            params["k31_cache_writes"] = json!([short, long]);
+        }
     }
     params["remote_prefill_cached_tokens"] = json!(cached);
     Ok(())
@@ -86,6 +100,18 @@ mod tests {
         let mut p=json!({"transfer_id":"abc","remote_engine_id":"P0"});
         attach_mooncake_prefill_usage(&response(json!(0)),&mut p).unwrap();
         assert_eq!(p,json!({"transfer_id":"abc","remote_engine_id":"P0","remote_prefill_cached_tokens":0}));
+    }
+    #[test]
+    fn carries_kimi_lease_bound_and_rejects_inconsistent_counters() {
+        let mut reply = json!({"model":"kimi-k3.1-pro","usage":{"prompt_tokens":8193,
+            "prompt_tokens_details":{"cached_tokens":4096,"cache_write_tokens":4096}},
+            "kv_transfer_params":{"k31_cache_read_limit":4096,"k31_cache_writes":[0,4096]}});
+        let mut transfer = json!({});
+        attach_mooncake_prefill_usage(&reply, &mut transfer).unwrap();
+        assert_eq!(transfer["k31_cache_read_limit"], 4096);
+        assert_eq!(transfer["k31_cache_writes"], json!([0,4096]));
+        reply["kv_transfer_params"]["k31_cache_writes"] = json!([4096,4096]);
+        assert!(attach_mooncake_prefill_usage(&reply, &mut json!({})).is_err());
     }
     #[test]
     fn forwards_verified_cache_creation_from_opted_in_prefills() {
