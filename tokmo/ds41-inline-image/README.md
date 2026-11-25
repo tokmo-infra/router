@@ -9,3 +9,9 @@ Chat Completions 的 `image_url`、Responses 的 `input_image`、Messages 的 ba
 Chat、Responses、Messages 和 Messages 计数接口按 router 收到的原始 JSON 字节数限制为 48 MiB（含边界）。若上游网关会重写 JSON，上游也需对原始客户请求体执行同一限制。
 
 在本目录执行 `python3 -m unittest -v test_normalize` 可复验边界值、透明度和跨接口生成字节的一致性。
+
+## DeepSeek PD 混部
+
+单池 HTTP Router 使用 `--worker-urls` 时，设置 `VLLM_ROUTER_DS41_COUPLED_FRONTEND=1` 和 `VLLM_ROUTER_DS41_IMAGE_WORKERS=2` 可启用与 PD 分离相同的图片处理。启用内存历史时，Responses 续写在 Router 恢复已完成的输入和输出，可跨 DP rank 和 API 进程。匹配的 Messages 和 Responses 请求会计入所选 rank 的在途负载，直到响应流完成或断开。开关默认为关闭，仅作用于普通 Router 的 DeepSeek Flash 请求。省略请求模型名时依照上述默认模型配置。
+
+执行 `VLLM_ROUTER_TEST_BINARY=/path/to/vllm-router python3 tokmo/ds41-inline-image/test_coupled_frontend.py` 可用本地模拟后端验证启用、关闭和同入口其他模型三种情况。

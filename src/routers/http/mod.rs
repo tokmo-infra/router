@@ -1,5 +1,6 @@
 //! HTTP router implementations
 
+mod coupled_deepseek;
 pub mod dp_utils;
 mod kimi_media;
 pub mod logprobs_merge;

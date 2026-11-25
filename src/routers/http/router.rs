@@ -1,3 +1,4 @@
+use super::coupled_deepseek::{may_have_media, CoupledDeepseek};
 use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
@@ -68,20 +69,44 @@ fn emit_http_first_sse<E>(
     let _ = tx.send(Ok(bytes::Bytes::from(comment)));
 }
 
+struct TrackedLoad(Arc<dyn Worker>);
+
+impl TrackedLoad {
+    fn acquire(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self(worker)
+    }
+
+    fn hold(self, response: Response) -> Response {
+        response.map(|body| {
+            Body::from_stream(LoadTrackedBody {
+                inner: Box::pin(body.into_data_stream()),
+                worker: Some(self),
+                producer_abort: None,
+            })
+        })
+    }
+}
+
+impl Drop for TrackedLoad {
+    fn drop(&mut self) {
+        self.0.decrement_load();
+        RouterMetrics::set_running_requests(self.0.url(), self.0.load());
+    }
+}
+
 struct LoadTrackedBody {
     inner: Pin<
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
     >,
-    worker: Option<Arc<dyn Worker>>,
+    worker: Option<TrackedLoad>,
     producer_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl LoadTrackedBody {
     fn release(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.decrement_load();
-            RouterMetrics::set_running_requests(worker.url(), worker.load());
-        }
+        self.worker.take();
     }
 }
 
@@ -126,7 +151,7 @@ fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) ->
     let (parts, body) = response.into_parts();
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),
-        worker: fallback_worker,
+        worker: fallback_worker.map(TrackedLoad),
         producer_abort,
     };
     Response::from_parts(parts, Body::from_stream(stream))
@@ -144,6 +169,7 @@ struct TypedDispatch<'a> {
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    coupled_deepseek: Option<CoupledDeepseek>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -346,6 +372,8 @@ impl Router {
         });
 
         Ok(Router {
+            coupled_deepseek: CoupledDeepseek::from_env(ctx.router_config.history_backend.clone())
+                .await?,
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -2226,8 +2254,38 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        let Some(frontend) = self.coupled_deepseek.as_ref().filter(|frontend| {
+            frontend
+                .media
+                .ds_request(&serde_json::json!({"model": body.model}))
+        }) else {
+            return self
+                .route_typed_request(headers, body, "/v1/chat/completions", model_id)
+                .await;
+        };
+        let normalized;
+        let (request, stats) = if body.messages.iter().any(may_have_media) {
+            let mut json = match serde_json::to_value(body) {
+                Ok(json) => json,
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            };
+            let stats = match frontend.media.prepare(&mut json).await {
+                Ok(stats) => stats,
+                Err(response) => return response,
+            };
+            normalized = match serde_json::from_value(json) {
+                Ok(request) => request,
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            };
+            (&normalized, stats)
+        } else {
+            (body, (0, 0))
+        };
+        let mut response = self
+            .route_typed_request(headers, request, "/v1/chat/completions", model_id)
+            .await;
+        frontend.media.add_headers(&mut response, stats);
+        response
     }
 
     async fn route_completion(
@@ -2411,14 +2469,59 @@ impl RouterTrait for Router {
         }
     }
 
-    /// Route a transparent proxy request to a backend worker
-    /// Forwards the request as-is to a selected worker
     async fn route_transparent(
         &self,
         headers: Option<&HeaderMap>,
         path: &str,
         method: &Method,
+        mut body: serde_json::Value,
+    ) -> Response {
+        let frontend = self.coupled_deepseek.as_ref().filter(|frontend| {
+            *method == Method::POST
+                && matches!(
+                    path,
+                    "/v1/responses" | "/v1/messages" | "/v1/messages/count_tokens"
+                )
+                && frontend.media.ds_request(&body)
+        });
+        let Some(frontend) = frontend else {
+            return self
+                .proxy_transparent(headers, path, method, body, false)
+                .await;
+        };
+        let stats = match frontend.media.prepare(&mut body).await {
+            Ok(stats) => stats,
+            Err(response) => return response,
+        };
+        let turn = match (path, &frontend.history) {
+            ("/v1/responses", Some(history)) => match history.prepare(headers, &mut body) {
+                Ok(turn) => turn,
+                Err(error) => return error.into_response(),
+            },
+            _ => None,
+        };
+        let response = self
+            .proxy_transparent(headers, path, method, body, true)
+            .await;
+        let mut response = match turn {
+            Some(turn) => turn.finish(response).await,
+            None => response,
+        };
+        frontend.media.add_headers(&mut response, stats);
+        response
+    }
+}
+
+impl Router {
+    /// Route a transparent proxy request to a backend worker
+    /// Forwards the request as-is to a selected worker
+    async fn proxy_transparent(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
         body: serde_json::Value,
+        track_load: bool,
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
@@ -2519,8 +2622,8 @@ impl RouterTrait for Router {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
 
-        // Send request
-        match otel_http::send_client_request(
+        let tracked = track_load.then(|| TrackedLoad::acquire(worker.clone()));
+        let response = match otel_http::send_client_request(
             request_builder,
             headers,
             ClientRequestOptions {
@@ -2644,6 +2747,10 @@ impl RouterTrait for Router {
                 )
                     .into_response()
             }
+        };
+        match tracked {
+            Some(load) => load.hold(response),
+            None => response,
         }
     }
 }
@@ -2668,6 +2775,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            coupled_deepseek: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2699,6 +2807,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            coupled_deepseek: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2849,6 +2958,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transparent_load_is_released_on_cancel_and_body_drop() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://worker:30020".into(),
+            WorkerType::Regular,
+        ));
+        let pending = TrackedLoad::acquire(worker.clone());
+        assert_eq!(worker.load(), 1);
+        drop(pending);
+        assert_eq!(worker.load(), 0);
+        let response = TrackedLoad::acquire(worker.clone()).hold(Response::new(Body::from("ok")));
+        assert_eq!(worker.load(), 1);
+        drop(response);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
     async fn test_add_worker_rejects_mixed_scheme() {
         let router = create_test_regular_router();
         let err = router
@@ -2963,6 +3088,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            coupled_deepseek: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
