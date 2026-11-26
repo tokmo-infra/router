@@ -2378,6 +2378,7 @@ impl RouterTrait for VllmPDRouter {
             Ok(value) => value,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {e}")).into_response(),
         };
+        super::ds41_sampling::normalize(&mut request_json, "/v1/chat/completions");
         let media = if let Some(pool) = self.media_pool.as_ref().filter(|p| p.chat_request(&request_json)) {
             match pool.prepare(&mut request_json).await {
                 Ok(stats) => Some(stats),
@@ -2729,6 +2730,7 @@ impl RouterTrait for VllmPDRouter {
         );
 
         let mut request_json = body;
+        super::ds41_sampling::normalize(&mut request_json, path);
         let image_pool = self.media_pool.as_ref().filter(|pool| pool.ds_request(&request_json) &&
             matches!(path, "/v1/responses" | "/v1/messages" | "/v1/messages/count_tokens"));
         // Store normalized Responses inputs so ID continuations reuse the same media bytes.

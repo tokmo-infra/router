@@ -1,6 +1,7 @@
 //! HTTP router implementations
 
 pub mod dp_utils;
+mod ds41_sampling;
 mod kimi_media;
 pub mod logprobs_merge;
 pub mod openai_router;
